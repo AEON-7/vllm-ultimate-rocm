@@ -1,0 +1,15 @@
+AEON vLLM Ultimate ROCm
+Copyright 2026 AEON-7
+
+This image is a Python overlay on vLLM v0.31.0 (Apache-2.0, Copyright
+contributors to the vLLM project). The two patched files keep that license.
+Their headers say what AEON-7 changed.
+
+vllm-omni, AITER, ROCm, and PyTorch are not included as new source here.
+They remain inside the official base image under their own licenses.
+
+DFlash2 was published by z-lab / Inco AI. Credit them when you serve a
+DFlash2 drafter.
+
+This build does not contain code from GGZ14/vllm-mxfp4, vllm-radiance,
+or libr4d. Those trees have no license that allows redistribution.
