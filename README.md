@@ -1,5 +1,7 @@
 # AEON vLLM Ultimate ROCm (x86)
 
+[![Buy me a lotus tea on LotusMake](https://lotusmake.com/badges/lotus-tea-dark.v1.svg)](https://lotusmake.com/support?via=tea)
+
 Early access. Pending community testing. This is not a final release.
 
 `ghcr.io/aeon-7/aeon-vllm-ultimate-rocm`
@@ -104,4 +106,6 @@ The two patches match the files in the ROCm serve kit. MXFP6 unpack-once has mat
 
 If load fails with `dict object has no attribute endswith`, the tag is not this image. v0.28 through v0.30 cannot read this checkpoint's `algo_config`.
 
-Support the work: [Patreon membership](https://www.patreon.com/cw/AeonForge7/membership).
+Support the work: Patreon wrongfully shut down our account without notice and never responded to our appeals, so we built something even better. You can now back this project on [LotusMake](https://lotusmake.com/c/aeon-forge) by buying us a Lotus Tea, funding GPU hours, backing a project you want to see done, or [subscribing](https://lotusmake.com/support?mode=tiers&from=%2Fc%2Faeon-forge) for early and full access to publications while supporting the work. You can also join LotusMake yourself, apply to become a creator, and get paid for the work you do in public.
+
+[![Buy me a lotus tea on LotusMake](https://lotusmake.com/badges/lotus-tea-dark.v1.svg)](https://lotusmake.com/support?via=tea)
