@@ -1,6 +1,6 @@
 # AEON vLLM Ultimate ROCm (x86)
 
-[![Buy me a lotus tea on LotusMake](https://lotusmake.com/badges/lotus-tea-dark.v1.svg)](https://lotusmake.com/support?via=tea)
+[![Buy me a coffee on LotusMake](https://lotusmake.com/badges/coffee-light.v2.svg)](https://lotusmake.com/support) [![Subscribe on lotusmake.com](https://lotusmake.com/badges/subscribe-light.v2.svg)](https://lotusmake.com/support?mode=tiers)
 
 Early access. Pending community testing. This is not a final release.
 
@@ -108,4 +108,4 @@ If load fails with `dict object has no attribute endswith`, the tag is not this 
 
 Support the work: Patreon wrongfully shut down our account without notice and never responded to our appeals, so we built something even better. You can now back this project on [LotusMake](https://lotusmake.com/c/aeon-forge) by buying us a Lotus Tea, funding GPU hours, backing a project you want to see done, or [subscribing](https://lotusmake.com/support?mode=tiers&from=%2Fc%2Faeon-forge) for early and full access to publications while supporting the work. You can also join LotusMake yourself, apply to become a creator, and get paid for the work you do in public.
 
-[![Buy me a lotus tea on LotusMake](https://lotusmake.com/badges/lotus-tea-dark.v1.svg)](https://lotusmake.com/support?via=tea)
+[![Buy me a coffee on LotusMake](https://lotusmake.com/badges/coffee-light.v2.svg)](https://lotusmake.com/support) [![Subscribe on lotusmake.com](https://lotusmake.com/badges/subscribe-light.v2.svg)](https://lotusmake.com/support?mode=tiers)
