@@ -17,6 +17,12 @@ git am /path/to/patches/inkling2/*.patch
 | 0004 | Per-pass KV caches and conv states for looped layers | port of the upstream NVIDIA design (`nvidia/attention.py`, `nvidia/loop.py`, #69028) to the AMD package | Apache-2.0 |
 | 0005 | Inkling-2-Mini (`inkling2_loop`) on RDNA4 and CDNA | loop model ported from upstream `nvidia/loop.py` (#69028); gfx12 wiring, arch gate, offloader hook are AEON | Apache-2.0 |
 | 0006 | AEON research hooks: weight overlay, activation capture, runtime o_proj ablation | original AEON work | Apache-2.0 |
+| 0007 | M2: decode MoE (fused router + per-expert GEMV) for T<=16 | original AEON work | Apache-2.0 |
+| 0008 | M2: fused decode loop-controller blend; single HW queue on ROCm | original AEON work | Apache-2.0 |
+| 0009 | M2: small-M bf16 GEMV for qkvr/o_proj/dynamic taps; multi-row decode MoE | original AEON work | Apache-2.0 |
+| 0010 | M2: fused router + sort top-k, dot-path MoE, MXFP8 hybrid decode, fused combine/norm, split-KV merge in attention | original AEON work | Apache-2.0 |
+| 0011 | M2: static short conv fused with the following AttnRes mix (T<=8); MoE T=1 retune | original AEON work | Apache-2.0 |
+| 0012 | M2: K/V tap projections in the qkvr GEMV launch; one message mix per loop pass | original AEON work | Apache-2.0 |
 
 Clean room: no code, binaries or images from vllm-redshift were read or used.
 Sources were upstream vLLM (Apache-2.0), the model's HF config and
@@ -28,7 +34,15 @@ transformers code, and AMD/Triton documentation.
 pins from upstream `docker/Dockerfile.rocm_base`), `tools/env.sh`, then
 `tools/build.sh` (`MAX_JOBS=6 uv pip install --no-build-isolation -e .`, plus
 `amdsmi` from the SDK so vLLM detects the ROCm platform).
-Never set `PYTORCH_HIP_ALLOC_CONF=expandable_segments`.
+Never set `PYTORCH_HIP_ALLOC_CONF=expandable_segments`. `tools/env.sh` sets
+`GPU_MAX_HW_QUEUES=1` (M2: one HW queue per device; graph dispatch stalls on
+cross-queue barriers on gfx12 otherwise).
+
+## M2 decode switches (all default on; set to 0 to fall back)
+
+`AEON_GEMV`, `AEON_FUSE_TAPS` (+ `AEON_FUSE_TAPS_MAX_M`, default 4),
+`AEON_BATCH_MESSAGES`, `AEON_FUSE_SCONV_MIX`, `AEON_FUSE_SPLIT_COMBINE`,
+`AEON_MOE_HYBRID_FMTS`. See `docs/inkling2-rocm/M2_RESULTS.md`.
 
 ## AEON hooks (patch 0006), all off by default
 
@@ -59,3 +73,8 @@ Never set `PYTORCH_HIP_ALLOC_CONF=expandable_segments`.
   per-layer, per-pass activation diff vs transformers.
 - `tools/hooks_test.py`: functional test of the AEON hooks.
 - `tools/prof_decode.py`: rough per-module decode time split.
+- M2: `tools/graph_gap.py` (graph-replay ms/step), `tools/gap_analyze.py`
+  (rocprofv3 kernel-trace breakdown), `tools/det_test.py` / `tools/det2.py`
+  (row-divergence / race checks), `tools/test_gemv2.py`, `tools/test_gemv3x.py`,
+  `tools/test_moe_*.py`, `tools/test_auto_mx.py`, `tools/test_cfg_t1.py`
+  (kernel unit tests), `tools/gen_bench_m2.json`, `tools/kl_m2_b8.json`.

@@ -1,0 +1,425 @@
+From 6a8ec4610d15022fad2a420746a5e83dfde62b43 Mon Sep 17 00:00:00 2001
+From: AEON-7 <aeon-7@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 20:11:25 -0600
+Subject: [PATCH 09/12] [AEON M2] inkling2 gfx12: small-M bf16 GEMV for
+ qkvr/o_proj/dynamic taps; multi-row decode MoE
+
+Original AEON work. ops/gemv.py: FMA GEMV for M<=4 (M<=8 for qkvr), with a
+tri-input variant that projects q-side/k/v of full layers in one launch.
+o_proj: the call is now _gemv.linear(output, wo_ud.weight); the AEON hook
+point right after the o_proj output is unchanged.
+moe_decode: one program per (column block, expert) covering all of the
+expert rows (decodes each weight tile once for up to 8 rows) for T>=4.
+---
+ vllm/models/inkling2/amd/attention.py      |  12 +-
+ vllm/models/inkling2/amd/ops/gemv.py       | 104 +++++++++++
+ vllm/models/inkling2/amd/ops/moe_decode.py | 206 ++++++++++++++++++++-
+ vllm/models/inkling2/amd/sconv.py          |   3 +-
+ 4 files changed, 312 insertions(+), 13 deletions(-)
+ create mode 100644 vllm/models/inkling2/amd/ops/gemv.py
+
+diff --git a/vllm/models/inkling2/amd/attention.py b/vllm/models/inkling2/amd/attention.py
+index 85de2b972..bff5146af 100644
+--- a/vllm/models/inkling2/amd/attention.py
++++ b/vllm/models/inkling2/amd/attention.py
+@@ -47,6 +47,7 @@ from .ops.attention import (
+     plan_decode_attention,
+     rel_decode_attention,
+ )
++from .ops import gemv as _gemv
+ from .ops.sconv import attention_prologue, shift_rel_proj
+ from .sconv import K_STREAM, V_STREAM, Inkling2ShortConv, conv_metadata
+ 
+@@ -266,10 +267,17 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+         self, x_q: torch.Tensor, x_k: torch.Tensor, x_v: torch.Tensor
+     ) -> list[torch.Tensor]:
+         weight = self.qkvr.weight
++        q_side, kv_size = sum(self.split_sizes[:4]), self.split_sizes[4]
++        if _gemv.eligible(x_q, _gemv.MAX_M_QKVR) and x_k.stride() == x_q.stride() == x_v.stride():
++            # Decode (AEON M2): one GEMV launch over all of qkvr, each row
++            # range against its own input (the same input for local layers).
++            projected = _gemv.gemv3(
++                x_q, x_k, x_v, weight, q_side, q_side + kv_size
++            )
++            return list(projected.split(self.split_sizes, dim=-1)[:6])
+         if x_k is x_q and x_v is x_q:
+             projected = nn.functional.linear(x_q, weight)
+             return list(projected.split(self.split_sizes, dim=-1)[:6])
+-        q_side, kv_size = sum(self.split_sizes[:4]), self.split_sizes[4]
+         k_end = q_side + kv_size
+         projected = nn.functional.linear(x_q, weight[: sum(self.q_side_splits)])
+         k = nn.functional.linear(x_k, weight[q_side:k_end])
+@@ -325,7 +333,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+             output,
+             pass_idx,
+         )
+-        out = nn.functional.linear(output, self.wo_ud.weight)
++        out = _gemv.linear(output, self.wo_ud.weight)  # o_proj; AEON hook point below
+         if HOOKS.enabled:
+             out = HOOKS.oproj(output, out)
+         return out
+diff --git a/vllm/models/inkling2/amd/ops/gemv.py b/vllm/models/inkling2/amd/ops/gemv.py
+new file mode 100644
+index 000000000..87521b2b7
+--- /dev/null
++++ b/vllm/models/inkling2/amd/ops/gemv.py
+@@ -0,0 +1,104 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright 2026 AEON-7
++# Original AEON work (clean room): small-M bf16 GEMM ("GEMV") for decode on
++# RDNA4, where hipBLASLt's M=1..16 tiles leave bandwidth unused.
++"""`y = x @ W.T` for bf16 `x` (M <= 16 rows) and a bf16 row-major `W`
++(N, K): FMA into a [BM, BN, BK] register accumulator, one reduction over K
++at the end, fp32 accumulate, bf16 output.
++
++`gemv3` runs one launch over a weight whose row ranges [0, n1), [n1, n2),
++[n2, N) take different inputs (the Inkling2 q-side / k / v projections of a
++full-attention layer)."""
++
++import os
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++# The GEMV beats hipBLASLt (uncached weights, gfx1201) up to M=4 in general
++# and up to M=8 for the fused qkvr projection (one launch instead of three).
++MAX_M = 4
++MAX_M_QKVR = 8
++ENABLED = os.environ.get("AEON_GEMV", "1") == "1"
++
++
++@triton.jit
++def _gemv_kernel(
++    X0, X1, X2, W, Y, M, N, K, N1, N2, stride_xm, stride_ym,
++    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, EVEN_N: tl.constexpr,
++):
++    n0 = tl.program_id(0) * BN
++    n_idx = n0 + tl.arange(0, BN)
++    m_idx = tl.arange(0, BM)
++    mm = m_idx < M
++    nm = n_idx < N
++    # Row blocks never straddle n1 / n2 (BN divides both).
++    if n0 < N1:
++        X = X0
++    elif n0 < N2:
++        X = X1
++    else:
++        X = X2
++    acc = tl.zeros((BM, BN, BK), tl.float32)
++    w_ptr = W + n_idx[:, None].to(tl.int64) * K
++    x_ptr = X + m_idx[:, None] * stride_xm
++    for k0 in range(0, K, BK):
++        kk = k0 + tl.arange(0, BK)
++        if EVEN_N:
++            w = tl.load(w_ptr + kk[None, :]).to(tl.float32)
++        else:
++            w = tl.load(w_ptr + kk[None, :], mask=nm[:, None], other=0.0).to(tl.float32)
++        x = tl.load(x_ptr + kk[None, :], mask=mm[:, None], other=0.0).to(tl.float32)
++        acc += x[:, None, :] * w[None, :, :]
++    y = tl.sum(acc, axis=2)
++    ptrs = Y + m_idx[:, None] * stride_ym + n_idx[None, :]
++    tl.store(ptrs, y.to(tl.bfloat16), mask=mm[:, None] & nm[None, :])
++
++
++def _cfg(M: int, K: int) -> tuple[int, int, int, int]:
++    """(BM, BN, BK, num_warps) from uncached sweeps on gfx1201."""
++    bm = triton.next_power_of_2(max(M, 1))
++    if bm <= 4:
++        bn, bk = 4, (512 if K % 512 == 0 else 256)
++    elif bm <= 8:
++        bn, bk = 2, 256
++    else:
++        bn, bk = 4, 128
++    while K % bk:
++        bk //= 2
++    return bm, bn, bk, 2
++
++
++def eligible(x: torch.Tensor, max_m: int = MAX_M) -> bool:
++    return (ENABLED and x.dim() == 2 and 0 < x.shape[0] <= max_m
++            and x.stride(1) == 1 and x.dtype == torch.bfloat16 and x.shape[1] % 64 == 0)
++
++
++def gemv3(x0, x1, x2, w, n1: int, n2: int, cfg=None) -> torch.Tensor:
++    """(M, N) bf16: rows [0, n1) of `w` against `x0`, [n1, n2) against
++    `x1`, [n2, N) against `x2` (all (M, K), same row stride)."""
++    M, K = x0.shape
++    N = w.shape[0]
++    assert w.shape[1] == K and w.stride(1) == 1
++    assert x1.shape == x0.shape and x2.shape == x0.shape
++    assert x1.stride() == x0.stride() and x2.stride() == x0.stride()
++    out = torch.empty((M, N), dtype=torch.bfloat16, device=x0.device)
++    bm, bn, bk, nw = cfg or _cfg(M, K)
++    assert n1 % bn == 0 and n2 % bn == 0
++    _gemv_kernel[(triton.cdiv(N, bn),)](
++        x0, x1, x2, w, out, M, N, K, n1, n2, x0.stride(0), out.stride(0),
++        BM=bm, BN=bn, BK=bk, EVEN_N=N % bn == 0, num_warps=nw)
++    return out
++
++
++def gemv(x: torch.Tensor, w: torch.Tensor, cfg=None) -> torch.Tensor:
++    N = w.shape[0]
++    return gemv3(x, x, x, w, N, N, cfg)
++
++
++def linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
++    """`nn.functional.linear(x, w)` (no bias), by the GEMV for M <= MAX_M."""
++    if eligible(x) and w.stride(1) == 1 and w.dtype == torch.bfloat16:
++        return gemv(x, w)
++    return torch.nn.functional.linear(x, w)
+diff --git a/vllm/models/inkling2/amd/ops/moe_decode.py b/vllm/models/inkling2/amd/ops/moe_decode.py
+index 1c54f92ab..2f4340491 100644
+--- a/vllm/models/inkling2/amd/ops/moe_decode.py
++++ b/vllm/models/inkling2/amd/ops/moe_decode.py
+@@ -273,6 +273,155 @@ def _expert_gemv_kernel(
+     tl.store(Out + r.to(tl.int64) * OUT_N + n_idx, y.to(tl.bfloat16))
+ 
+ 
++@triton.jit
++def _gemv_rows_tile(W, S, G, expert, n_idx, xb, rm, K: tl.constexpr, N: tl.constexpr,
++                    FMT: tl.constexpr, RB: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
++                    HW_FP8: tl.constexpr):
++    """fp32 [RB, BN]: RB input rows (base pointers `xb`, mask `rm`) against
++    the same expert rows; each weight tile is decoded once for all RB rows.
++    Block-factored like `_gemv_tile_fast`."""
++    row = (expert * N + n_idx).to(tl.int64)
++    if FMT == 0:
++        NB: tl.constexpr = BK // 16
++        acc = tl.zeros((RB, BN, NB), tl.float32)
++        jb = tl.arange(0, NB)
++        ib = tl.arange(0, 8)
++        for k0 in range(0, K, BK):
++            off = (row[:, None, None] * (K // 2) + k0 // 2
++                   + jb[None, :, None] * 8 + ib[None, None, :])
++            p = tl.load(W + off).to(tl.int32)
++            lo = _e2m1_half(p & 15)
++            hi = _e2m1_half(p >> 4)
++            xo = k0 + jb[:, None] * 16 + 2 * ib[None, :]
++            xp = xb[:, None, None] + xo[None, :, :]
++            x_e = tl.load(xp, mask=rm[:, None, None], other=0.0).to(tl.float32)
++            x_o = tl.load(xp + 1, mask=rm[:, None, None], other=0.0).to(tl.float32)
++            part = tl.sum(lo[None, :, :, :] * x_e[:, None, :, :]
++                          + hi[None, :, :, :] * x_o[:, None, :, :], axis=3)
++            sb = tl.load(S + row[:, None] * (K // 16) + k0 // 16 + jb[None, :])
++            if HW_FP8:
++                sc = sb.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++            else:
++                sc = _e4m3_to_f32(sb.to(tl.int32))
++            acc += part * sc[None, :, :]
++        return tl.sum(acc, axis=2) * (tl.load(G + expert) * 16384.0)
++    else:
++        NB: tl.constexpr = BK // 32
++        acc = tl.zeros((RB, BN, NB), tl.float32)
++        jb = tl.arange(0, NB)
++        ib = tl.arange(0, 32)
++        for k0 in range(0, K, BK):
++            kk = k0 + jb[:, None] * 32 + ib[None, :]
++            b = tl.load(W + row[:, None, None] * K + kk[None, :, :])
++            if HW_FP8:
++                v = b.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++            else:
++                v = _e4m3_to_f32(b.to(tl.int32))
++            x = tl.load(xb[:, None, None] + kk[None, :, :], mask=rm[:, None, None], other=0.0).to(tl.float32)
++            part = tl.sum(v[None, :, :, :] * x[:, None, :, :], axis=3)
++            s = _e8m0_to_f32(tl.load(S + row[:, None] * (K // 32) + k0 // 32 + jb[None, :]).to(tl.int32))
++            acc += part * s[None, :, :]
++        return tl.sum(acc, axis=2)
++
++
++@triton.jit
++def _expert_gemv_rows_kernel(
++    X, W, S, G, Out, Count, Bucket, Active,
++    TOPK: tl.constexpr, N: tl.constexpr, K: tl.constexpr, OUT_N: tl.constexpr,
++    MAXR: tl.constexpr, FMT: tl.constexpr, GATED: tl.constexpr, GATHER: tl.constexpr,
++    HW_FP8: tl.constexpr, GATE_CAP: tl.constexpr, UP_CAP: tl.constexpr,
++    RB: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
++):
++    """One program per (BN output columns, active expert, block of RB rows
++    of that expert)."""
++    expert = tl.load(Active + tl.program_id(1))
++    if expert < 0:
++        return
++    cnt = tl.load(Count + expert)
++    m0 = tl.program_id(2) * RB
++    if m0 >= cnt:
++        return
++    m_idx = m0 + tl.arange(0, RB)
++    rm = m_idx < cnt
++    r = tl.load(Bucket + expert * MAXR + m_idx, mask=rm, other=0)
++    if GATHER:
++        src = (r // TOPK).to(tl.int64)
++    else:
++        src = r.to(tl.int64)
++    xb = X + src * K
++    n_idx = tl.program_id(0) * BN + tl.arange(0, BN)
++    a = _gemv_rows_tile(W, S, G, expert, n_idx, xb, rm, K, N, FMT, RB, BN, BK, HW_FP8)
++    if GATED:
++        u = _gemv_rows_tile(W, S, G, expert, n_idx + OUT_N, xb, rm, K, N, FMT, RB, BN, BK, HW_FP8)
++        gate = a.to(tl.bfloat16).to(tl.float32)
++        up = u.to(tl.bfloat16).to(tl.float32)
++        sig = 1.0 / (1.0 + tl.exp(-gate))
++        y = _softcap(gate, GATE_CAP) * sig * _softcap(up, UP_CAP)
++    else:
++        y = a
++    tl.store(Out + r.to(tl.int64)[:, None] * OUT_N + n_idx[None, :], y.to(tl.bfloat16),
++             mask=rm[:, None])
++
++
++@triton.jit
++def _rows_out(W, S, G, Out, expert, n_idx, X, r, rm, TOPK: tl.constexpr, N: tl.constexpr,
++              K: tl.constexpr, OUT_N: tl.constexpr, FMT: tl.constexpr, GATED: tl.constexpr,
++              GATHER: tl.constexpr, HW_FP8: tl.constexpr, GATE_CAP: tl.constexpr,
++              UP_CAP: tl.constexpr, RB: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
++    if GATHER:
++        src = (r // TOPK).to(tl.int64)
++    else:
++        src = r.to(tl.int64)
++    xb = X + src * K
++    a = _gemv_rows_tile(W, S, G, expert, n_idx, xb, rm, K, N, FMT, RB, BN, BK, HW_FP8)
++    if GATED:
++        u = _gemv_rows_tile(W, S, G, expert, n_idx + OUT_N, xb, rm, K, N, FMT, RB, BN, BK, HW_FP8)
++        gate = a.to(tl.bfloat16).to(tl.float32)
++        up = u.to(tl.bfloat16).to(tl.float32)
++        sig = 1.0 / (1.0 + tl.exp(-gate))
++        y = _softcap(gate, GATE_CAP) * sig * _softcap(up, UP_CAP)
++    else:
++        y = a
++    tl.store(Out + r.to(tl.int64)[:, None] * OUT_N + n_idx[None, :], y.to(tl.bfloat16),
++             mask=rm[:, None])
++
++
++@triton.jit
++def _expert_gemv_auto_kernel(
++    X, W, S, G, Out, Count, Bucket, Active,
++    TOPK: tl.constexpr, N: tl.constexpr, K: tl.constexpr, OUT_N: tl.constexpr,
++    MAXR: tl.constexpr, FMT: tl.constexpr, GATED: tl.constexpr, GATHER: tl.constexpr,
++    HW_FP8: tl.constexpr, GATE_CAP: tl.constexpr, UP_CAP: tl.constexpr,
++    RBMAX: tl.constexpr, BN: tl.constexpr, BK1: tl.constexpr, BK2: tl.constexpr,
++    BKM: tl.constexpr,
++):
++    """One program per (BN columns, active expert), all rows of the expert:
++    a single row decodes like the per-row kernel; 2 or more rows share each
++    decoded weight tile (RBMAX rows at a time)."""
++    expert = tl.load(Active + tl.program_id(1))
++    if expert < 0:
++        return
++    cnt = tl.load(Count + expert)
++    n_idx = tl.program_id(0) * BN + tl.arange(0, BN)
++    if cnt == 1:
++        m1 = tl.arange(0, 1)
++        r = tl.load(Bucket + expert * MAXR + m1)
++        _rows_out(W, S, G, Out, expert, n_idx, X, r, m1 < 1, TOPK, N, K, OUT_N, FMT,
++                  GATED, GATHER, HW_FP8, GATE_CAP, UP_CAP, 1, BN, BK1)
++    elif cnt == 2:
++        m2 = tl.arange(0, 2)
++        r = tl.load(Bucket + expert * MAXR + m2)
++        _rows_out(W, S, G, Out, expert, n_idx, X, r, m2 < 2, TOPK, N, K, OUT_N, FMT,
++                  GATED, GATHER, HW_FP8, GATE_CAP, UP_CAP, 2, BN, BK2)
++    else:
++        for m0 in range(0, cnt, RBMAX):
++            m = m0 + tl.arange(0, RBMAX)
++            rm = m < cnt
++            r = tl.load(Bucket + expert * MAXR + m, mask=rm, other=0)
++            _rows_out(W, S, G, Out, expert, n_idx, X, r, rm, TOPK, N, K, OUT_N, FMT,
++                      GATED, GATHER, HW_FP8, GATE_CAP, UP_CAP, RBMAX, BN, BKM)
++
++
+ @triton.jit
+ def _combine_kernel(Down, Wts, Out, TOPK: tl.constexpr, D: tl.constexpr, BD: tl.constexpr):
+     t = tl.program_id(0)
+@@ -296,6 +445,13 @@ HW_FP8 = True
+ EXACT = os.environ.get("AEON_MOE_EXACT", "0") == "1"
+ 
+ # (BN, BK, num_warps) per (format, projection); tuned on R9700.
++# (fmt, maxr) -> rows per program of the multi-row GEMV (1: per-row kernel).
++_RB = {}
++AUTO_ROWS = os.environ.get("AEON_MOE_AUTO_ROWS", "1") == "1"
++AUTO_RBMAX = int(os.environ.get("AEON_MOE_RBMAX", "8"))
++# (fmt, proj) -> (BN, BK for 1 row, BK for 2 rows, BK for RBMAX rows, num_warps)
++_AUTO_CFG = {(0, 13): (16, 256, 128, 64, 4), (0, 2): (16, 128, 128, 64, 4),
++             (1, 13): (16, 128, 64, 32, 4), (1, 2): (16, 64, 64, 32, 4)}
+ _CFG = {
+     (0, 13): (16, 256, 4), (0, 2): (16, 128, 2),
+     (1, 13): (16, 64, 4), (1, 2): (16, 64, 4),
+@@ -338,16 +494,46 @@ def moe_decode(x, weight, bias, topk, route_scale, w13, w2, fmt, gate_cap, up_ca
+     _route_kernel[(T,)](logits, bias, ids, wts, count, bucket, active, nactive,
+                         E=E, TOPK=topk, SCALE=route_scale, MAXR=maxr, num_warps=TOPK_WARPS)
+     act = torch.empty((rows, inter), dtype=torch.bfloat16, device=dev)
+-    bn, bk, nw = cfg[(fmt, 13)]
+-    _expert_gemv_kernel[(inter // bn, n_act, maxr)](
+-        x, w13_w, w13_s, w13_s if w13_g is None else w13_g, act, count, bucket, active,
+-        TOPK=topk, N=n13, K=D, OUT_N=inter, MAXR=maxr, FMT=fmt, GATED=True, GATHER=True,
+-        HW_FP8=HW_FP8, GATE_CAP=gate_cap, UP_CAP=up_cap, BN=bn, BK=bk, ROUND=EXACT, num_warps=nw)
++    if AUTO_ROWS and maxr >= 4 and not EXACT:
++        rbmax = min(maxr, AUTO_RBMAX)
++        bn, bk1, bk2, bkm, nw = _AUTO_CFG[(fmt, 13)]
++        _expert_gemv_auto_kernel[(inter // bn, n_act)](
++            x, w13_w, w13_s, w13_s if w13_g is None else w13_g, act, count, bucket, active,
++            TOPK=topk, N=n13, K=D, OUT_N=inter, MAXR=maxr, FMT=fmt, GATED=True, GATHER=True,
++            HW_FP8=HW_FP8, GATE_CAP=gate_cap, UP_CAP=up_cap, RBMAX=rbmax, BN=bn,
++            BK1=bk1, BK2=bk2, BKM=bkm, num_warps=nw)
++        down = torch.empty((rows, D), dtype=torch.bfloat16, device=dev)
++        bn, bk1, bk2, bkm, nw = _AUTO_CFG[(fmt, 2)]
++        _expert_gemv_auto_kernel[(D // bn, n_act)](
++            act, w2_w, w2_s, w2_s if w2_g is None else w2_g, down, count, bucket, active,
++            TOPK=topk, N=D, K=inter, OUT_N=D, MAXR=maxr, FMT=fmt, GATED=False, GATHER=False,
++            HW_FP8=HW_FP8, GATE_CAP=gate_cap, UP_CAP=up_cap, RBMAX=rbmax, BN=bn,
++            BK1=bk1, BK2=bk2, BKM=bkm, num_warps=nw)
++        _combine_kernel[(T, D // 256)](down, wts, out, TOPK=topk, D=D, BD=256, num_warps=4)
++        return out, ids, wts
++    rb = _RB.get((fmt, maxr), 1) if not EXACT else 1
++    bn, bk, nw = cfg.get((fmt, 13, rb), cfg[(fmt, 13)]) if rb > 1 else cfg[(fmt, 13)]
++    if rb > 1:
++        _expert_gemv_rows_kernel[(inter // bn, n_act, triton.cdiv(maxr, rb))](
++            x, w13_w, w13_s, w13_s if w13_g is None else w13_g, act, count, bucket, active,
++            TOPK=topk, N=n13, K=D, OUT_N=inter, MAXR=maxr, FMT=fmt, GATED=True, GATHER=True,
++            HW_FP8=HW_FP8, GATE_CAP=gate_cap, UP_CAP=up_cap, RB=rb, BN=bn, BK=bk, num_warps=nw)
++    else:
++        _expert_gemv_kernel[(inter // bn, n_act, maxr)](
++            x, w13_w, w13_s, w13_s if w13_g is None else w13_g, act, count, bucket, active,
++            TOPK=topk, N=n13, K=D, OUT_N=inter, MAXR=maxr, FMT=fmt, GATED=True, GATHER=True,
++            HW_FP8=HW_FP8, GATE_CAP=gate_cap, UP_CAP=up_cap, BN=bn, BK=bk, ROUND=EXACT, num_warps=nw)
+     down = torch.empty((rows, D), dtype=torch.bfloat16, device=dev)
+-    bn, bk, nw = cfg[(fmt, 2)]
+-    _expert_gemv_kernel[(D // bn, n_act, maxr)](
+-        act, w2_w, w2_s, w2_s if w2_g is None else w2_g, down, count, bucket, active,
+-        TOPK=topk, N=D, K=inter, OUT_N=D, MAXR=maxr, FMT=fmt, GATED=False, GATHER=False,
+-        HW_FP8=HW_FP8, GATE_CAP=gate_cap, UP_CAP=up_cap, BN=bn, BK=bk, ROUND=EXACT, num_warps=nw)
++    bn, bk, nw = cfg.get((fmt, 2, rb), cfg[(fmt, 2)]) if rb > 1 else cfg[(fmt, 2)]
++    if rb > 1:
++        _expert_gemv_rows_kernel[(D // bn, n_act, triton.cdiv(maxr, rb))](
++            act, w2_w, w2_s, w2_s if w2_g is None else w2_g, down, count, bucket, active,
++            TOPK=topk, N=D, K=inter, OUT_N=D, MAXR=maxr, FMT=fmt, GATED=False, GATHER=False,
++            HW_FP8=HW_FP8, GATE_CAP=gate_cap, UP_CAP=up_cap, RB=rb, BN=bn, BK=bk, num_warps=nw)
++    else:
++        _expert_gemv_kernel[(D // bn, n_act, maxr)](
++            act, w2_w, w2_s, w2_s if w2_g is None else w2_g, down, count, bucket, active,
++            TOPK=topk, N=D, K=inter, OUT_N=D, MAXR=maxr, FMT=fmt, GATED=False, GATHER=False,
++            HW_FP8=HW_FP8, GATE_CAP=gate_cap, UP_CAP=up_cap, BN=bn, BK=bk, ROUND=EXACT, num_warps=nw)
+     _combine_kernel[(T, D // 256)](down, wts, out, TOPK=topk, D=D, BD=256, num_warps=4)
+     return out, ids, wts
+diff --git a/vllm/models/inkling2/amd/sconv.py b/vllm/models/inkling2/amd/sconv.py
+index cbcfd3ec7..932cbfc75 100644
+--- a/vllm/models/inkling2/amd/sconv.py
++++ b/vllm/models/inkling2/amd/sconv.py
+@@ -27,6 +27,7 @@ from vllm.models.inkling.amd.sconv_swa_attn import (
+     InklingSconvMetadata,
+ )
+ 
++from .ops import gemv as _gemv
+ from .ops.linear import linear_k_groups
+ from .ops.sconv import short_conv
+ 
+@@ -118,7 +119,7 @@ class Inkling2ShortConv(nn.Module):
+             4,
+         ):
+             return linear_k_groups(x.contiguous(), self.weight_proj, x.dtype)
+-        return nn.functional.linear(x, self.weight_proj)
++        return _gemv.linear(x, self.weight_proj)
+ 
+     def forward(
+         self,
+-- 
+2.53.0
+

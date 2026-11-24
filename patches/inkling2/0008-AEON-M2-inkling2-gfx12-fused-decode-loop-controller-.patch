@@ -1,0 +1,219 @@
+From e7e1c880421e28f8329c486a8341e675e03927b3 Mon Sep 17 00:00:00 2001
+From: AEON-7 <aeon-7@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 20:00:42 -0600
+Subject: [PATCH 08/12] [AEON M2] inkling2 gfx12: fused decode loop-controller
+ blend; single HW queue on ROCm
+
+Original AEON work. ops/loop_decode.py fuses pair RMS, the rank-64 down
+GEMM, the fp32 gain/forget GEMM, the blend and the RMSNorm into three
+kernels for T<=16 (bit-identical to the unfused chain in tests).
+env_override: GPU_MAX_HW_QUEUES=1 by default (AEON_SINGLE_HW_QUEUE=0 to
+opt out); with several HW queues a waiting barrier packet stalled dispatch
+in replayed decode graphs (~10 us per kernel on gfx1201).
+---
+ vllm/env_override.py                        |   8 ++
+ vllm/models/inkling2/amd/loop.py            |   7 +-
+ vllm/models/inkling2/amd/ops/loop_decode.py | 145 ++++++++++++++++++++
+ 3 files changed, 159 insertions(+), 1 deletion(-)
+ create mode 100644 vllm/models/inkling2/amd/ops/loop_decode.py
+
+diff --git a/vllm/env_override.py b/vllm/env_override.py
+index f8eb4e824..bb1e69745 100644
+--- a/vllm/env_override.py
++++ b/vllm/env_override.py
+@@ -167,6 +167,14 @@ os.environ["PYTORCH_NVML_BASED_CUDA_CHECK"] = "1"
+ # https://github.com/vllm-project/vllm/issues/10619.
+ os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
+ 
++# AEON (ROCm, gfx12): map every HIP stream of a process to one hardware
++# queue. With several queues, a barrier packet waiting on one queue stalls
++# kernel dispatch on the others, adding ~10 us between the kernels of a
++# replayed decode CUDA graph (25 -> 16 ms per Inkling2 decode step on an
++# R9700). Read by the HIP runtime at initialization; ignored elsewhere.
++if os.environ.get("AEON_SINGLE_HW_QUEUE", "1") == "1":
++    os.environ.setdefault("GPU_MAX_HW_QUEUES", "1")
++
+ # Enable Triton autotuning result caching to disk by default.
+ # Without this, Triton re-runs autotuning on every process restart,
+ # adding significant latency to the first inference request.
+diff --git a/vllm/models/inkling2/amd/loop.py b/vllm/models/inkling2/amd/loop.py
+index 6afecf0fb..0bc1edd07 100644
+--- a/vllm/models/inkling2/amd/loop.py
++++ b/vllm/models/inkling2/amd/loop.py
+@@ -33,6 +33,8 @@ from .model import (
+ )
+ from .ops.attn_res import attn_res
+ from .ops.loop import blend_rms_norm, pair_rms_norm
++from .ops.loop_decode import MAX_T as _BLEND_MAX_T
++from .ops.loop_decode import blend_decode
+ 
+ LOOP_STREAMS = ("attn", "k", "v", "mlp")
+ 
+@@ -123,9 +125,12 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
+         """The `streams` controllers on fp32 `(S, T, D)` `dest` (may
+         broadcast over streams) and `message`, each output RMS-normalized
+         with its row of `norm_weight` `(S, D)`: bf16 `(S, T, D)`."""
+-        pair = pair_rms_norm(dest, message)
+         down = self.controller_down[streams]
+         up = self.controller_gain_forget[streams]
++        if 0 < message.shape[1] <= _BLEND_MAX_T:
++            # Decode batches (AEON M2): fused chain, same numerics.
++            return blend_decode(dest, message, down, up, norm_weight, norm_eps)
++        pair = pair_rms_norm(dest, message)
+         # bf16 operands, fp32 accumulate; the gain/forget output stays fp32.
+         hidden = torch.bmm(pair, down.transpose(1, 2))
+         gain_forget = torch.bmm(hidden.float(), up.float().transpose(1, 2))
+diff --git a/vllm/models/inkling2/amd/ops/loop_decode.py b/vllm/models/inkling2/amd/ops/loop_decode.py
+new file mode 100644
+index 000000000..e991d926c
+--- /dev/null
++++ b/vllm/models/inkling2/amd/ops/loop_decode.py
+@@ -0,0 +1,145 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright 2026 AEON-7
++# Original AEON work (clean room): decode-sized fusion of the loop message
++# controller chain of `ops.loop` (pair RMS -> down GEMM -> fp32 gain/forget
++# GEMM -> blend -> RMSNorm) into three small kernels, for T <= MAX_T tokens.
++"""Fused loop-controller blend for decode batches.
++
++Numerics follow the unfused chain: the pair is RMS-normalized in fp32 and
++rounded to bf16, the rank-r hidden is accumulated in fp32 and rounded to
++bf16, gain/forget are fp32 products of the bf16 hidden and bf16 up weights,
++and the blend and RMSNorm are fp32 without FMA contraction."""
++
++import torch
++
++from vllm.triton_utils import tl, tldevice, triton
++
++MAX_T = 16
++
++
++@triton.jit
++def _down_kernel(
++    Dest, Message, Down, Hidden, stride_dest_s, T,
++    D: tl.constexpr, R: tl.constexpr, BT: tl.constexpr, BN: tl.constexpr,
++    BK: tl.constexpr,
++):
++    """hidden[s, t, n] = bf16(sum_k bf16(pair[s, t, k]) * down[s, n, k]) for
++    BN rows n; pair = [dest * rstd(dest), message * rstd(message)]."""
++    s = tl.program_id(0).to(tl.int64)
++    n_idx = tl.program_id(1) * BN + tl.arange(0, BN)
++    t_idx = tl.arange(0, BT)
++    tm = t_idx < T
++    d_base = Dest + s * stride_dest_s + t_idx[:, None] * D
++    m_base = Message + (s * T + t_idx[:, None]) * D
++    # Row sums of squares (fp32, as the reference kernel: sum then / D).
++    sd = tl.zeros((BT, BK), tl.float32)
++    sm = tl.zeros((BT, BK), tl.float32)
++    for k0 in range(0, D, BK):
++        kk = k0 + tl.arange(0, BK)
++        a = tl.load(d_base + kk[None, :], mask=tm[:, None], other=0.0)
++        b = tl.load(m_base + kk[None, :], mask=tm[:, None], other=0.0)
++        sd += a * a
++        sm += b * b
++    rd = tl.rsqrt(tl.div_rn(tl.sum(sd, axis=1), D) + 1e-6)
++    rm = tl.rsqrt(tl.div_rn(tl.sum(sm, axis=1), D) + 1e-6)
++    acc = tl.zeros((BT, BN, BK), tl.float32)
++    w_base = Down + (s * R + n_idx[:, None]) * (2 * D)
++    for k0 in range(0, D, BK):
++        kk = k0 + tl.arange(0, BK)
++        a = tl.load(d_base + kk[None, :], mask=tm[:, None], other=0.0)
++        a = (a * rd[:, None]).to(tl.bfloat16).to(tl.float32)
++        w = tl.load(w_base + kk[None, :]).to(tl.float32)
++        acc += a[:, None, :] * w[None, :, :]
++        b = tl.load(m_base + kk[None, :], mask=tm[:, None], other=0.0)
++        b = (b * rm[:, None]).to(tl.bfloat16).to(tl.float32)
++        w = tl.load(w_base + D + kk[None, :]).to(tl.float32)
++        acc += b[:, None, :] * w[None, :, :]
++    h = tl.sum(acc, axis=2).to(tl.bfloat16)
++    tl.store(Hidden + (s * T + t_idx[:, None]) * R + n_idx[None, :], h, mask=tm[:, None])
++
++
++@triton.jit
++def _up_blend_kernel(
++    Dest, Message, Hidden, Up, X, SumSq, stride_dest_s, T,
++    D: tl.constexpr, R: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr,
++):
++    """For a BD-column chunk: gain/forget = hidden @ up.T (fp32), x = (1 -
++    tanh(forget)) * dest + tanh(gain) * message, store x and the chunk's
++    sum of squares."""
++    s = tl.program_id(0).to(tl.int64)
++    c = tl.program_id(1)
++    d_idx = c * BD + tl.arange(0, BD)
++    t_idx = tl.arange(0, BT)
++    tm = t_idx < T
++    r_idx = tl.arange(0, R)
++    h = tl.load(Hidden + (s * T + t_idx[:, None]) * R + r_idx[None, :],
++                mask=tm[:, None], other=0.0).to(tl.float32)          # [BT, R]
++    ug = tl.load(Up + (s * 2 * D + d_idx[:, None]) * R + r_idx[None, :]).to(tl.float32)      # [BD, R]
++    uf = tl.load(Up + (s * 2 * D + D + d_idx[:, None]) * R + r_idx[None, :]).to(tl.float32)  # [BD, R]
++    gain = tl.sum(h[:, None, :] * ug[None, :, :], axis=2)                # [BT, BD]
++    forget = tl.sum(h[:, None, :] * uf[None, :, :], axis=2)
++    dest = tl.load(Dest + s * stride_dest_s + t_idx[:, None] * D + d_idx[None, :],
++                   mask=tm[:, None], other=0.0)
++    msg = tl.load(Message + (s * T + t_idx[:, None]) * D + d_idx[None, :],
++                  mask=tm[:, None], other=0.0)
++    x = (1.0 - tldevice.tanh(forget)) * dest + tldevice.tanh(gain) * msg
++    row = s * T + t_idx
++    tl.store(X + row[:, None] * D + d_idx[None, :], x, mask=tm[:, None])
++    tl.store(SumSq + row * (D // BD) + c, tl.sum(x * x, axis=1), mask=tm)
++
++
++@triton.jit
++def _norm_kernel(
++    X, SumSq, NormW, Out, stride_w_s, T, eps,
++    D: tl.constexpr, NC: tl.constexpr, NCP: tl.constexpr, BD: tl.constexpr,
++):
++    s = tl.program_id(0).to(tl.int64)
++    t = tl.program_id(1)
++    c = tl.program_id(2)
++    row = s * T + t
++    ci = tl.arange(0, NCP)
++    ss = tl.sum(tl.load(SumSq + row * NC + ci, mask=ci < NC, other=0.0), axis=0)
++    rstd = tl.rsqrt(tl.div_rn(ss, D) + eps)
++    d_idx = c * BD + tl.arange(0, BD)
++    x = tl.load(X + row * D + d_idx)
++    y = (x * rstd) * tl.load(NormW + s * stride_w_s + d_idx).to(tl.float32)
++    tl.store(Out + row * D + d_idx, y.to(tl.bfloat16))
++
++
++def blend_decode(
++    dest: torch.Tensor,
++    message: torch.Tensor,
++    down: torch.Tensor,
++    up: torch.Tensor,
++    norm_weight: torch.Tensor,
++    norm_eps: float,
++) -> torch.Tensor:
++    """Same contract as `Inkling2LoopDecoderLayer.blend` for T <= MAX_T:
++    fp32 `(S, T, D)` `dest` (may broadcast over S) and `message`, bf16 `down`
++    `(S, R, 2D)` and `up` `(S, 2D, R)`, `norm_weight` `(S, D)` -> bf16
++    `(S, T, D)`."""
++    S, T, D = message.shape
++    R = down.shape[1]
++    assert message.is_contiguous() and dest.stride(1) == D and dest.stride(2) == 1
++    assert down.is_contiguous() and up.is_contiguous() and norm_weight.stride(1) == 1
++    out = message.new_empty((S, T, D), dtype=torch.bfloat16)
++    if T == 0:
++        return out
++    bt = triton.next_power_of_2(T)
++    hidden = message.new_empty((S, T, R), dtype=torch.bfloat16)
++    bn, bk, nw = (1, 128, 4) if bt <= 2 else ((2, 128, 4) if bt <= 4 else (2, 256, 8))
++    _down_kernel[(S, R // bn)](
++        dest, message, down, hidden, dest.stride(0), T,
++        D=D, R=R, BT=bt, BN=bn, BK=bk, num_warps=nw)
++    bd = 32 if bt <= 2 else (16 if bt <= 4 else 8)
++    nc = D // bd
++    x = message.new_empty((S, T, D))
++    sumsq = message.new_empty((S, T, nc))
++    _up_blend_kernel[(S, nc)](
++        dest, message, hidden, up, x, sumsq, dest.stride(0), T,
++        D=D, R=R, BT=bt, BD=bd, num_warps=1, enable_fp_fusion=False)
++    bd2 = 256
++    _norm_kernel[(S, T, D // bd2)](
++        x, sumsq, norm_weight, out, norm_weight.stride(0), T, norm_eps,
++        D=D, NC=nc, NCP=triton.next_power_of_2(nc), BD=bd2, num_warps=2, enable_fp_fusion=False)
++    return out
+-- 
+2.53.0
+

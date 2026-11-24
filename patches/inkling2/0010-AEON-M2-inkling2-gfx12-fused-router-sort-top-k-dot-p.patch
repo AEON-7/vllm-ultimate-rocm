@@ -1,0 +1,727 @@
+From 9de5cc6ecfc163f7a58a0c8fb969381cb4badc61 Mon Sep 17 00:00:00 2001
+From: AEON-7 <aeon-7@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 21:14:41 -0600
+Subject: [PATCH 10/12] [AEON M2] inkling2 gfx12: fused router+sort top-k,
+ dot-path MoE for shared experts, MXFP8 hybrid decode, fused combine/norm,
+ split-KV merge in attention
+
+- moe_decode: router logits kernel runs a single bitonic-sort top-k for all
+  tokens in its last arriver; experts with 3+ rows use a bf16-dequant tl.dot
+  path (NVFP4 auto kernel); MXFP8 decode uses per-row GEMV + dot kernel
+  (hybrid) and now covers T<=16; expert combine fused into the w2 kernel.
+- loop_decode: RMSNorm fused into the up-blend last arriver.
+- ops/attention: split-KV partials merged in the attention kernel last
+  arriver (AEON_FUSE_SPLIT_COMBINE=0 restores the second launch).
+- All last-arriver sites take a workgroup barrier before the arrival atomic
+  (fixes a cross-warp visibility race that made identical rows diverge).
+- o_proj hook point (HOOKS.oproj) unchanged.
+
+gen_bench bs1 75.8 tok/s, bs8 371.3 tok/s; KL 0.00209 / top-1 98.30% (60 prompts, eager, max-batched 16).
+---
+ vllm/models/inkling2/amd/ops/attention.py   | 134 ++++++++-
+ vllm/models/inkling2/amd/ops/loop_decode.py |  41 ++-
+ vllm/models/inkling2/amd/ops/moe_decode.py  | 303 ++++++++++++++++++--
+ 3 files changed, 457 insertions(+), 21 deletions(-)
+
+diff --git a/vllm/models/inkling2/amd/ops/attention.py b/vllm/models/inkling2/amd/ops/attention.py
+index 62b9aef0f..65671f992 100644
+--- a/vllm/models/inkling2/amd/ops/attention.py
++++ b/vllm/models/inkling2/amd/ops/attention.py
+@@ -27,7 +27,7 @@ _SPLIT_PROGRAMS_PER_CU = 2
+ _MAX_SPLITS = 128
+ 
+ 
+-@triton.jit(do_not_specialize=["num_splits", "num_tokens"])
++@triton.jit(do_not_specialize=["num_splits", "num_tokens", "n_req_q"])
+ def _rel_attention_kernel(
+     Q,
+     K,
+@@ -65,7 +65,21 @@ def _rel_attention_kernel(
+     BLOCK_Q: tl.constexpr,
+     BLOCK_H: tl.constexpr,
+     BLOCK_N: tl.constexpr,
++    Gate=None,
++    Sink=None,
++    Y=None,
++    Ctr=None,
++    stride_gate=0,
++    stride_sink=0,
++    n_req_q=0,
++    FUSE_COMBINE: tl.constexpr = False,
++    H_ALL: tl.constexpr = 1,
++    BLOCK_S: tl.constexpr = 64,
+ ):
++    # AEON-7 FUSE_COMBINE (split-KV decode): the last split program of a
++    # (request, KV head) to finish merges the partials of its tokens and
++    # heads (the `_split_combine_kernel` math, gated) and resets its arrival
++    # counter, saving the second launch.
+     # `WINDOW` (or -1) is the largest visible query-key distance. `DRAFT`:
+     # no relative logits, and every query sits at its request's last key.
+     # `SPLIT`: program `s` of `num_splits` holds all queries of the request,
+@@ -78,6 +92,16 @@ def _rel_attention_kernel(
+     req = tl.program_id(2)
+     q_start = tl.load(CuSeqlensQ + req)
+     q_len = tl.load(CuSeqlensQ + req + 1) - q_start
++    if FUSE_COMBINE:
++        # Tokens of no request (padding) come out zero (as in the merge kernel).
++        if (tl.program_id(0) == 0) & (req == 0):
++            n_req_tok = tl.load(CuSeqlensQ + n_req_q)
++            zh = kv_head * GROUP + tl.arange(0, BLOCK_H)
++            zd = tl.arange(0, D)
++            for zt in range(n_req_tok, num_tokens):
++                tl.store(Y + zt.to(tl.int64) * H_ALL * D + zh[:, None] * D + zd[None, :],
++                         tl.zeros([BLOCK_H, D], Y.dtype.element_ty),
++                         (tl.arange(0, BLOCK_H) < GROUP)[:, None])
+     if SPLIT:
+         split = tl.program_id(0)
+         step = num_splits
+@@ -181,6 +205,59 @@ def _rel_attention_kernel(
+         if not SPLIT:
+             lse *= 0.6931471805599453
+         tl.store(Lse + head * stride_lh + out_token, lse, row_valid)
++    if FUSE_COMBINE:
++        cidx = req * tl.num_programs(1) + kv_head
++        tl.debug_barrier()  # all warps' stores issued before the arrival
++        c = tl.atomic_add(Ctr + cidx, 1, sem="acq_rel")
++        if (c == num_splits - 1) & (req < n_req_q):
++            for qi in range(q_len):
++                row = (q_start + qi).to(tl.int64)
++                for hh in tl.static_range(GROUP):
++                    _merge_head(Out, Lse, Gate, Sink, Y, row, kv_head * GROUP + hh,
++                                num_splits, num_tokens, stride_lh, stride_gate,
++                                stride_sink, H_ALL, D, BLOCK_S)
++            tl.atomic_xchg(Ctr + cidx, 0)
++
++
++@triton.jit
++def _merge_head(OPart, LsePart, Gate, Sink, Y, row, head, num_splits, num_tokens,
++                stride_lh, stride_gate, stride_sink, H: tl.constexpr, D: tl.constexpr,
++                BLOCK_S: tl.constexpr):
++    """`_split_combine_kernel` (GATED) for one token row and head."""
++    offs_d = tl.arange(0, D)
++    m_i = tl.full([1], float("-inf"), tl.float32)
++    l_i = tl.zeros([1], tl.float32)
++    acc = tl.zeros([D], tl.float32)
++    for first in range(0, num_splits, BLOCK_S):
++        splits = first + tl.arange(0, BLOCK_S)
++        part = splits * num_tokens + row
++        lse = tl.load(
++            LsePart + head * stride_lh + part, splits < num_splits, other=float("-inf"),
++            volatile=True,
++        )
++        m_new = tl.maximum(m_i, tl.max(lse, 0))
++        m_ref = tl.where(m_new == float("-inf"), 0.0, m_new)
++        alpha = tl.math.exp2(m_i - m_ref)
++        w = tl.math.exp2(lse - m_ref)
++        o = tl.load(
++            OPart + (part * H + head)[:, None] * D + offs_d[None, :],
++            (w > 0.0)[:, None],
++            other=0.0,
++            volatile=True,
++        )
++        acc = acc * alpha + tl.sum(o * w[:, None], 0)
++        l_i = l_i * alpha + tl.sum(w, 0)
++        m_i = m_new
++    has_keys = l_i > 0.0
++    y = acc / tl.where(has_keys, l_i, 1.0)
++    gate = tl.load(Gate + row * stride_gate + head * D + offs_d).to(tl.float32)
++    sink = tl.load(Sink + row * stride_sink + head).to(tl.float32)
++    lse_e = tl.where(
++        has_keys, (m_i + tl.math.log2(l_i)) * 0.6931471805599453, float("-inf")
++    )
++    y = y * _sigmoid(gate)
++    y = y * _sigmoid(lse_e - sink)
++    tl.store(Y + row * H * D + head * D + offs_d, y.to(Y.dtype.element_ty))
+ 
+ 
+ def rel_attention(
+@@ -329,6 +406,27 @@ def rel_decode_attention(
+     assert out.shape == gate.shape and out.is_contiguous()
+     _check_sheared_bias(rel_logits, q)
+     extent = rel_logits.shape[2] - 256
++    if FUSE_SPLIT_COMBINE and max_query_len * triton.next_power_of_2(
++        q.shape[1] // key_cache.shape[2]
++    ) <= _DECODE_BLOCK_M:
++        _launch(
++            q,
++            key_cache,
++            value_cache,
++            rel_logits,
++            None,
++            None,
++            block_table,
++            cache_seqlens,
++            cu_seqlens_q,
++            max_query_len,
++            softmax_scale,
++            extent - 1 if is_local else -1,
++            draft=False,
++            num_splits=num_splits,
++            fused=(gate, sinks, out, cu_seqlens_q.shape[0] - 1),
++        )
++        return
+     o_part, lse_part = _launch(
+         q,
+         key_cache,
+@@ -412,6 +510,7 @@ def _launch(
+     window: int,
+     draft: bool,
+     num_splits: int = 0,
++    fused: tuple | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     """Launch `_rel_attention_kernel` and return `(out, lse)`.
+ 
+@@ -479,10 +578,43 @@ def _launch(
+         BLOCK_N=_BLOCK_N,
+         num_warps=4 if block_m <= 64 else 8,
+         num_stages=1,
++        **_fused_kwargs(fused, q, num_splits, num_kv_heads, num_reqs),
+     )
+     return out, lse
+ 
+ 
++# AEON-7: merge split-KV partials in the attention kernel's last arriver.
++import os as _os  # noqa: E402
++
++FUSE_SPLIT_COMBINE = _os.environ.get("AEON_FUSE_SPLIT_COMBINE", "1") == "1"
++_ATTN_COUNTERS: dict = {}
++
++
++def _fused_kwargs(fused, q, num_splits, num_kv_heads, num_reqs) -> dict:
++    if fused is None:
++        return {}
++    gate, sinks, y, n_req_q = fused
++    key = str(q.device)
++    need = num_reqs * num_kv_heads
++    ctr = _ATTN_COUNTERS.get(key)
++    if ctr is None or ctr.numel() < need:
++        # Persistent, self-resetting; first allocated in the eager warmup.
++        ctr = torch.zeros(max(4096, need), dtype=torch.int32, device=q.device)
++        _ATTN_COUNTERS[key] = ctr
++    return dict(
++        Gate=gate,
++        Sink=sinks,
++        Y=y,
++        Ctr=ctr,
++        stride_gate=gate.stride(0),
++        stride_sink=sinks.stride(0),
++        n_req_q=n_req_q,
++        FUSE_COMBINE=True,
++        H_ALL=q.shape[1],
++        BLOCK_S=4 if num_splits <= 4 else 64,
++    )
++
++
+ @triton.jit(do_not_specialize=["num_reqs", "num_splits", "num_tokens"])
+ def _split_combine_kernel(
+     OPart,
+diff --git a/vllm/models/inkling2/amd/ops/loop_decode.py b/vllm/models/inkling2/amd/ops/loop_decode.py
+index e991d926c..d5ca03046 100644
+--- a/vllm/models/inkling2/amd/ops/loop_decode.py
++++ b/vllm/models/inkling2/amd/ops/loop_decode.py
+@@ -10,11 +10,23 @@ rounded to bf16, the rank-r hidden is accumulated in fp32 and rounded to
+ bf16, gain/forget are fp32 products of the bf16 hidden and bf16 up weights,
+ and the blend and RMSNorm are fp32 without FMA contraction."""
+ 
++import os
++
+ import torch
+ 
+ from vllm.triton_utils import tl, tldevice, triton
+ 
+-MAX_T = 16
++MAX_T = 8
++FUSE_NORM = os.environ.get("AEON_FUSE_BLEND_NORM", "1") == "1"
++_COUNTERS: dict = {}
++
++
++def _counters(dev) -> torch.Tensor:
++    """Persistent zeroed int32 arrival counters (self-resetting)."""
++    key = str(dev)
++    if key not in _COUNTERS:
++        _COUNTERS[key] = torch.zeros(64, dtype=torch.int32, device=dev)
++    return _COUNTERS[key]
+ 
+ 
+ @triton.jit
+@@ -62,6 +74,8 @@ def _down_kernel(
+ def _up_blend_kernel(
+     Dest, Message, Hidden, Up, X, SumSq, stride_dest_s, T,
+     D: tl.constexpr, R: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr,
++    Ctr=None, NormW=None, Out=None, stride_w_s=0, eps=0.0,
++    FUSE_NORM: tl.constexpr = False, NCP: tl.constexpr = 1,
+ ):
+     """For a BD-column chunk: gain/forget = hidden @ up.T (fp32), x = (1 -
+     tanh(forget)) * dest + tanh(gain) * message, store x and the chunk's
+@@ -86,6 +100,24 @@ def _up_blend_kernel(
+     row = s * T + t_idx
+     tl.store(X + row[:, None] * D + d_idx[None, :], x, mask=tm[:, None])
+     tl.store(SumSq + row * (D // BD) + c, tl.sum(x * x, axis=1), mask=tm)
++    if FUSE_NORM:
++        # The last chunk program of stream s applies the RMSNorm to its rows.
++        NC: tl.constexpr = D // BD
++        tl.debug_barrier()  # all warps' stores issued before the arrival
++        n = tl.atomic_add(Ctr + s, 1)
++        if n == NC - 1:
++            ci = tl.arange(0, NCP)
++            for t in range(T):
++                rw = s * T + t
++                ss = tl.sum(tl.load(SumSq + rw * NC + ci, mask=ci < NC, other=0.0,
++                                    volatile=True), axis=0)
++                rstd = tl.rsqrt(tl.div_rn(ss, D) + eps)
++                for d0 in range(0, D, 256):
++                    dd = d0 + tl.arange(0, 256)
++                    xv = tl.load(X + rw * D + dd, volatile=True)
++                    y = (xv * rstd) * tl.load(NormW + s * stride_w_s + dd).to(tl.float32)
++                    tl.store(Out + rw * D + dd, y.to(tl.bfloat16))
++            tl.atomic_xchg(Ctr + s, 0)
+ 
+ 
+ @triton.jit
+@@ -135,6 +167,13 @@ def blend_decode(
+     nc = D // bd
+     x = message.new_empty((S, T, D))
+     sumsq = message.new_empty((S, T, nc))
++    if FUSE_NORM:
++        _up_blend_kernel[(S, nc)](
++            dest, message, hidden, up, x, sumsq, dest.stride(0), T,
++            D=D, R=R, BT=bt, BD=bd, Ctr=_counters(message.device), NormW=norm_weight,
++            Out=out, stride_w_s=norm_weight.stride(0), eps=norm_eps, FUSE_NORM=True,
++            NCP=triton.next_power_of_2(nc), num_warps=1, enable_fp_fusion=False)
++        return out
+     _up_blend_kernel[(S, nc)](
+         dest, message, hidden, up, x, sumsq, dest.stride(0), T,
+         D=D, R=R, BT=bt, BD=bd, num_warps=1, enable_fp_fusion=False)
+diff --git a/vllm/models/inkling2/amd/ops/moe_decode.py b/vllm/models/inkling2/amd/ops/moe_decode.py
+index 2f4340491..d93ad645c 100644
+--- a/vllm/models/inkling2/amd/ops/moe_decode.py
++++ b/vllm/models/inkling2/amd/ops/moe_decode.py
+@@ -35,9 +35,11 @@ from .moe_dequant import _e4m3_to_f32, _e8m0_to_f32, _softcap
+ 
+ @triton.jit
+ def _router_logits_kernel(
+-    X, Wr, Logits, Count, Active, T,
++    X, Wr, Logits, Count, Active, T, Done, Bias, Ids, Wts, Bucket,
+     D: tl.constexpr, E: tl.constexpr, N_ACT: tl.constexpr,
+     BE: tl.constexpr, BD: tl.constexpr, BT: tl.constexpr,
++    FUSE_TOPK: tl.constexpr = False, TOPK: tl.constexpr = 8, SCALE: tl.constexpr = 1.0,
++    MAXR: tl.constexpr = 1, SORT_TOPK: tl.constexpr = False,
+ ):
+     """fp32 router logits [T, E] for a block of BE experts and all T tokens
+     (each router weight read once). Program 0 also resets the routing
+@@ -61,6 +63,83 @@ def _router_logits_kernel(
+         acc += x[:, None, :] * w[None, :, :]
+     lg = tl.sum(acc, axis=2)
+     tl.store(Logits + t_idx[:, None] * E + e_idx[None, :], lg, mask=tm[:, None])
++    if FUSE_TOPK:
++        # The last program to finish runs the top-k for every token (saves a
++        # launch); it resets the arrival counter for the next call.
++        tl.debug_barrier()  # all warps' stores issued before the arrival
++        n = tl.atomic_add(Done, 1)
++        if n == tl.num_programs(0) - 1:
++            if SORT_TOPK:
++                _topk_all(Logits, Bias, Ids, Wts, Count, Bucket, Active, Count + E, T,
++                          E, TOPK, SCALE, MAXR, BT)
++            else:
++                for t in range(T):
++                    _topk_row(Logits, Bias, Ids, Wts, Count, Bucket, Active, Count + E, t,
++                              E, TOPK, SCALE, MAXR)
++            tl.atomic_xchg(Done, 0)
++
++
++@triton.jit
++def _topk_all(Logits, Bias, Ids, Wts, Count, Bucket, Active, NActive, T,
++              E: tl.constexpr, TOPK: tl.constexpr, SCALE: tl.constexpr, MAXR: tl.constexpr,
++              BT: tl.constexpr):
++    """Top-k of score + bias for all T tokens at once with one bitonic sort.
++    Key = order-preserving int of the fp32 selection value in the high word,
++    (E - 1 - expert) in the low word, so a descending sort gives the order of
++    a serial argmax (higher value first, lower index on ties)."""
++    t_idx = tl.arange(0, BT)
++    tm = t_idx < T
++    e_idx = tl.arange(0, E)
++    lg = tl.load(Logits + t_idx[:, None] * E + e_idx[None, :], mask=tm[:, None], other=0.0,
++                 volatile=True)
++    score = 1.0 / (1.0 + tl.exp(-lg))
++    sel = score + tl.load(Bias + e_idx)[None, :]
++    b = sel.to(tl.int32, bitcast=True)
++    key = tl.where(b >= 0, b, b ^ 0x7FFFFFFF).to(tl.int64)
++    key = (key << 32) | (E - 1 - e_idx[None, :]).to(tl.int64)
++    srt = tl.sort(key, 1, descending=True)
++    k_idx = tl.arange(0, TOPK)
++    top = tl.sum(tl.where(e_idx[None, None, :] == k_idx[None, :, None], srt[:, None, :], 0), axis=2)
++    ids = (E - 1 - (top & 0xFFFFFFFF)).to(tl.int32)                  # [BT, TOPK]
++    wts = tl.sum(tl.where(e_idx[None, None, :] == ids[:, :, None], score[:, None, :], 0.0), axis=2)
++    m2 = tm[:, None] & (k_idx[None, :] >= 0)
++    slot = tl.atomic_add(Count + ids, 1, mask=m2)
++    rr = t_idx[:, None] * TOPK + k_idx[None, :]
++    tl.store(Bucket + ids * MAXR + slot, rr, mask=m2)
++    first = m2 & (slot == 0)
++    a = tl.atomic_add(NActive + ids * 0, 1, mask=first)
++    tl.store(Active + a, ids, mask=first)
++    wts = wts / (tl.sum(wts, axis=1)[:, None] + 1e-20) * SCALE
++    tl.store(Ids + rr, ids, mask=m2)
++    tl.store(Wts + rr, wts, mask=m2)
++
++
++@triton.jit
++def _topk_row(Logits, Bias, Ids, Wts, Count, Bucket, Active, NActive, t,
++              E: tl.constexpr, TOPK: tl.constexpr, SCALE: tl.constexpr, MAXR: tl.constexpr):
++    """Top-k of score + bias for token t without a serial loop: each
++    expert's rank is the number of experts ahead of it (higher value, or
++    equal value and lower index, the order of a serial argmax)."""
++    e_idx = tl.arange(0, E)
++    acc = tl.load(Logits + t * E + e_idx, volatile=True)
++    score = 1.0 / (1.0 + tl.exp(-acc))
++    sel = score + tl.load(Bias + e_idx)
++    sel_j = tl.load(Logits + t * E + e_idx, volatile=True)
++    sel_j = 1.0 / (1.0 + tl.exp(-sel_j)) + tl.load(Bias + e_idx)
++    ahead = (sel_j[None, :] > sel[:, None]) | ((sel_j[None, :] == sel[:, None]) & (e_idx[None, :] < e_idx[:, None]))
++    rank = tl.sum(ahead.to(tl.int32), axis=1)                       # [E]
++    k_idx = tl.arange(0, TOPK)
++    hit = rank[None, :] == k_idx[:, None]                            # [TOPK, E]
++    ids = tl.sum(tl.where(hit, e_idx[None, :], 0), axis=1)
++    wts = tl.sum(tl.where(hit, score[None, :], 0.0), axis=1)
++    slot = tl.atomic_add(Count + ids, 1)
++    tl.store(Bucket + ids * MAXR + slot, t * TOPK + k_idx)
++    first = slot == 0
++    a = tl.atomic_add(NActive + k_idx * 0, 1, mask=first)
++    tl.store(Active + a, ids, mask=first)
++    wts = wts / (tl.sum(wts, axis=0) + 1e-20) * SCALE
++    tl.store(Ids + t * TOPK + k_idx, ids)
++    tl.store(Wts + t * TOPK + k_idx, wts)
+ 
+ 
+ @triton.jit
+@@ -231,6 +310,18 @@ def _gemv_tile_fast(W, S, G, expert, n_idx, x_ptr, K: tl.constexpr, N: tl.conste
+         return tl.sum(acc, axis=1)
+ 
+ 
++@triton.jit
++def _combine_cols(Down, Wts, Final, n_idx, T, TOPK: tl.constexpr, D: tl.constexpr):
++    """Final[t, n_idx] = bf16(sum_k bf16 down[t*TOPK+k, n_idx] * wts[t, k]) in
++    slot order (as `_combine_kernel`)."""
++    for t in range(T):
++        acc = tl.zeros(n_idx.shape, tl.float32)
++        for k in range(TOPK):
++            r = t * TOPK + k
++            acc += tl.load(Down + r.to(tl.int64) * D + n_idx, volatile=True).to(tl.float32) * tl.load(Wts + r)
++        tl.store(Final + t.to(tl.int64) * D + n_idx, acc.to(tl.bfloat16))
++
++
+ @triton.jit
+ def _expert_gemv_kernel(
+     X, W, S, G, Out, Count, Bucket, Active,
+@@ -238,16 +329,23 @@ def _expert_gemv_kernel(
+     MAXR: tl.constexpr, FMT: tl.constexpr, GATED: tl.constexpr, GATHER: tl.constexpr,
+     HW_FP8: tl.constexpr, GATE_CAP: tl.constexpr, UP_CAP: tl.constexpr,
+     BN: tl.constexpr, BK: tl.constexpr, ROUND: tl.constexpr = True,
++    Ctr=None, Wts=None, Final=None, T=1, FUSE_COMBINE: tl.constexpr = False,
++    SKIP_MIN: tl.constexpr = 0,
+ ):
+     """One program per (BN output columns, active expert, row of that
+     expert). Programs of one expert are adjacent so shared weight reads
+-    hit in cache. GATED: SwiGLU of the gate and up GEMVs (W13)."""
++    hit in cache. GATED: SwiGLU of the gate and up GEMVs (W13). SKIP_MIN > 0:
++    experts with that many rows or more are left to `_expert_dot_kernel`."""
+     expert = tl.load(Active + tl.program_id(1))
+     if expert < 0:
+         return
+     m = tl.program_id(2)
+-    if m >= tl.load(Count + expert):
++    cnt0 = tl.load(Count + expert)
++    if m >= cnt0:
+         return
++    if SKIP_MIN > 0:
++        if cnt0 >= SKIP_MIN:
++            return
+     r = tl.load(Bucket + expert * MAXR + m)
+     if GATHER:
+         src = (r // TOPK).to(tl.int64)
+@@ -271,6 +369,13 @@ def _expert_gemv_kernel(
+     else:
+         y = a
+     tl.store(Out + r.to(tl.int64) * OUT_N + n_idx, y.to(tl.bfloat16))
++    if FUSE_COMBINE:
++        # The last of the T*TOPK row programs of this column block combines.
++        tl.debug_barrier()  # all warps' stores issued before the arrival
++        c = tl.atomic_add(Ctr + tl.program_id(0), 1)
++        if c == T * TOPK - 1:
++            _combine_cols(Out, Wts, Final, n_idx, T, TOPK, OUT_N)
++            tl.atomic_xchg(Ctr + tl.program_id(0), 0)
+ 
+ 
+ @triton.jit
+@@ -386,6 +491,53 @@ def _rows_out(W, S, G, Out, expert, n_idx, X, r, rm, TOPK: tl.constexpr, N: tl.c
+              mask=rm[:, None])
+ 
+ 
++@triton.jit
++def _dot_tile(W, S, G, expert, n_idx, xb, rm, K: tl.constexpr, N: tl.constexpr,
++              FMT: tl.constexpr, RB: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
++              HW_FP8: tl.constexpr):
++    """fp32 [RB, BN] by tl.dot (WMMA): each weight tile is dequantized to bf16
++    once (rounded like the reference dequant) and multiplied with RB padded
++    input rows. Used when an expert has 3+ rows (compute would dominate the
++    FMA GEMV)."""
++    acc = tl.zeros((RB, BN), tl.float32)
++    for k0 in range(0, K, BK):
++        lo, hi = _dec_tile(W, S, G, expert, n_idx, k0, N, K, FMT, BN, BK, HW_FP8)
++        if FMT == 0:
++            ke = k0 + 2 * tl.arange(0, BK // 2)
++            x_e = tl.load(xb[:, None] + ke[None, :], mask=rm[:, None], other=0.0)
++            x_o = tl.load(xb[:, None] + ke[None, :] + 1, mask=rm[:, None], other=0.0)
++            acc = tl.dot(x_e, tl.trans(lo), acc)
++            acc = tl.dot(x_o, tl.trans(hi), acc)
++        else:
++            kk = k0 + tl.arange(0, BK)
++            x = tl.load(xb[:, None] + kk[None, :], mask=rm[:, None], other=0.0)
++            acc = tl.dot(x, tl.trans(lo), acc)
++    return acc
++
++
++@triton.jit
++def _rows_out_dot(W, S, G, Out, expert, n_idx, X, r, rm, TOPK: tl.constexpr, N: tl.constexpr,
++                  K: tl.constexpr, OUT_N: tl.constexpr, FMT: tl.constexpr, GATED: tl.constexpr,
++                  GATHER: tl.constexpr, HW_FP8: tl.constexpr, GATE_CAP: tl.constexpr,
++                  UP_CAP: tl.constexpr, RB: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
++    if GATHER:
++        src = (r // TOPK).to(tl.int64)
++    else:
++        src = r.to(tl.int64)
++    xb = X + src * K
++    a = _dot_tile(W, S, G, expert, n_idx, xb, rm, K, N, FMT, RB, BN, BK, HW_FP8)
++    if GATED:
++        u = _dot_tile(W, S, G, expert, n_idx + OUT_N, xb, rm, K, N, FMT, RB, BN, BK, HW_FP8)
++        gate = a.to(tl.bfloat16).to(tl.float32)
++        up = u.to(tl.bfloat16).to(tl.float32)
++        sig = 1.0 / (1.0 + tl.exp(-gate))
++        y = _softcap(gate, GATE_CAP) * sig * _softcap(up, UP_CAP)
++    else:
++        y = a
++    tl.store(Out + r.to(tl.int64)[:, None] * OUT_N + n_idx[None, :], y.to(tl.bfloat16),
++             mask=rm[:, None])
++
++
+ @triton.jit
+ def _expert_gemv_auto_kernel(
+     X, W, S, G, Out, Count, Bucket, Active,
+@@ -393,7 +545,9 @@ def _expert_gemv_auto_kernel(
+     MAXR: tl.constexpr, FMT: tl.constexpr, GATED: tl.constexpr, GATHER: tl.constexpr,
+     HW_FP8: tl.constexpr, GATE_CAP: tl.constexpr, UP_CAP: tl.constexpr,
+     RBMAX: tl.constexpr, BN: tl.constexpr, BK1: tl.constexpr, BK2: tl.constexpr,
+-    BKM: tl.constexpr,
++    BKM: tl.constexpr, DOT: tl.constexpr = False, RBD: tl.constexpr = 16,
++    BKD: tl.constexpr = 64, DOT_MIN: tl.constexpr = 3,
++    NActive=None, Ctr=None, Wts=None, Final=None, T=1, FUSE_COMBINE: tl.constexpr = False,
+ ):
+     """One program per (BN columns, active expert), all rows of the expert:
+     a single row decodes like the per-row kernel; 2 or more rows share each
+@@ -408,6 +562,12 @@ def _expert_gemv_auto_kernel(
+         r = tl.load(Bucket + expert * MAXR + m1)
+         _rows_out(W, S, G, Out, expert, n_idx, X, r, m1 < 1, TOPK, N, K, OUT_N, FMT,
+                   GATED, GATHER, HW_FP8, GATE_CAP, UP_CAP, 1, BN, BK1)
++    elif DOT and cnt >= DOT_MIN:
++        md = tl.arange(0, RBD)
++        rmd = md < cnt
++        rd = tl.load(Bucket + expert * MAXR + md, mask=rmd & (md < MAXR), other=0)
++        _rows_out_dot(W, S, G, Out, expert, n_idx, X, rd, rmd, TOPK, N, K, OUT_N, FMT,
++                      GATED, GATHER, HW_FP8, GATE_CAP, UP_CAP, RBD, BN, BKD)
+     elif cnt == 2:
+         m2 = tl.arange(0, 2)
+         r = tl.load(Bucket + expert * MAXR + m2)
+@@ -420,6 +580,43 @@ def _expert_gemv_auto_kernel(
+             r = tl.load(Bucket + expert * MAXR + m, mask=rm, other=0)
+             _rows_out(W, S, G, Out, expert, n_idx, X, r, rm, TOPK, N, K, OUT_N, FMT,
+                       GATED, GATHER, HW_FP8, GATE_CAP, UP_CAP, RBMAX, BN, BKM)
++    if FUSE_COMBINE:
++        tl.debug_barrier()  # all warps' stores issued before the arrival
++        c = tl.atomic_add(Ctr + tl.program_id(0), 1)
++        if c == tl.load(NActive, volatile=True) - 1:
++            _combine_cols(Out, Wts, Final, n_idx, T, TOPK, OUT_N)
++            tl.atomic_xchg(Ctr + tl.program_id(0), 0)
++
++
++@triton.jit
++def _expert_dot_kernel(
++    X, W, S, G, Out, Count, Bucket, Active,
++    TOPK: tl.constexpr, N: tl.constexpr, K: tl.constexpr, OUT_N: tl.constexpr,
++    MAXR: tl.constexpr, FMT: tl.constexpr, GATED: tl.constexpr, GATHER: tl.constexpr,
++    HW_FP8: tl.constexpr, GATE_CAP: tl.constexpr, UP_CAP: tl.constexpr,
++    RBD: tl.constexpr, BN: tl.constexpr, BKD: tl.constexpr, DOT_MIN: tl.constexpr,
++    Ctr=None, Wts=None, Final=None, T=1, FUSE_COMBINE: tl.constexpr = False,
++):
++    """One program per (BN columns, active expert) for experts with DOT_MIN+
++    rows (the per-row GEMV kernel skips them): all rows at once by tl.dot.
++    Every program arrives on the counter (no early return), so with
++    FUSE_COMBINE the last of the n_act programs of a column block combines
++    after both kernels' outputs are written (the GEMV kernel ran before)."""
++    expert = tl.load(Active + tl.program_id(1))
++    cnt = tl.load(Count + tl.maximum(expert, 0))
++    n_idx = tl.program_id(0) * BN + tl.arange(0, BN)
++    if (expert >= 0) & (cnt >= DOT_MIN):
++        md = tl.arange(0, RBD)
++        rmd = md < cnt
++        rd = tl.load(Bucket + expert * MAXR + md, mask=rmd & (md < MAXR), other=0)
++        _rows_out_dot(W, S, G, Out, expert, n_idx, X, rd, rmd, TOPK, N, K, OUT_N, FMT,
++                      GATED, GATHER, HW_FP8, GATE_CAP, UP_CAP, RBD, BN, BKD)
++    if FUSE_COMBINE:
++        tl.debug_barrier()  # all warps' stores issued before the arrival
++        c = tl.atomic_add(Ctr + tl.program_id(0), 1)
++        if c == tl.num_programs(1) - 1:
++            _combine_cols(Out, Wts, Final, n_idx, T, TOPK, OUT_N)
++            tl.atomic_xchg(Ctr + tl.program_id(0), 0)
+ 
+ 
+ @triton.jit
+@@ -434,12 +631,12 @@ def _combine_kernel(Down, Wts, Out, TOPK: tl.constexpr, D: tl.constexpr, BD: tl.
+ 
+ 
+ MAX_DECODE_TOKENS = int(os.environ.get("AEON_MOE_DECODE_MAX", "16"))
+-# MXFP8 decode GEMV only beats the grouped GEMM path at very small T.
+-MXFP8_MAX_TOKENS = min(MAX_DECODE_TOKENS, 2)
++# MXFP8 decode (hybrid GEMV + dot) beats the grouped GEMM path up to T=16.
++MXFP8_MAX_TOKENS = min(MAX_DECODE_TOKENS, int(os.environ.get("AEON_MXFP8_DECODE_MAX", "16")))
+ TOPK_WARPS = int(os.environ.get("AEON_TOPK_WARPS", "1"))
+ # maxr (padded token count) -> (experts per program, BD, num_warps)
+ _ROUTER_CFG = {1: (1, 128, 4), 2: (1, 128, 4), 4: (1, 256, 8), 8: (1, 256, 8), 16: (1, 128, 8)}
+-HW_FP8 = True
++HW_FP8 = os.environ.get("AEON_HW_FP8", "0") == "1"  # software e4m3 decode is faster on gfx1201
+ # AEON_MOE_EXACT=1: round each dequantized weight to bf16 like the reference
+ # (slower); default is the block-factored fp32 path.
+ EXACT = os.environ.get("AEON_MOE_EXACT", "0") == "1"
+@@ -447,14 +644,42 @@ EXACT = os.environ.get("AEON_MOE_EXACT", "0") == "1"
+ # (BN, BK, num_warps) per (format, projection); tuned on R9700.
+ # (fmt, maxr) -> rows per program of the multi-row GEMV (1: per-row kernel).
+ _RB = {}
++FUSE_ROUTER = os.environ.get("AEON_FUSE_ROUTER", "1") == "1"
++# Sort-based top-k for all tokens at once (T >= SORT_TOPK_MIN) in the fused router.
++SORT_TOPK_MIN = int(os.environ.get("AEON_SORT_TOPK_MIN", "2"))
++FUSE_COMBINE = os.environ.get("AEON_FUSE_COMBINE", "1") == "1"
++_COUNTERS: dict = {}
++
++
++def _counters(dev) -> torch.Tensor:
++    """Persistent zeroed int32 arrival counters (self-resetting kernels);
++    first allocated in the eager warmup, before graph capture."""
++    key = str(dev)
++    if key not in _COUNTERS:
++        _COUNTERS[key] = torch.zeros(1024, dtype=torch.int32, device=dev)
++    return _COUNTERS[key]
++
++
+ AUTO_ROWS = os.environ.get("AEON_MOE_AUTO_ROWS", "1") == "1"
+ AUTO_RBMAX = int(os.environ.get("AEON_MOE_RBMAX", "8"))
++# 3+ rows of one expert: dequantize to bf16 once and use tl.dot (WMMA).
++AUTO_DOT = os.environ.get("AEON_MOE_DOT", "1") == "1"
++DOT_MIN = int(os.environ.get("AEON_MOE_DOT_MIN", "3"))
++# Hybrid (default): per-row GEMV kernel for experts with < DOT_MIN rows plus a
++# tl.dot kernel for the rest (two launches per projection); replaces the
++# single auto kernel, whose combined code ran the 1-row case slower.
++# Per format: MXFP8 uses the hybrid, NVFP4 the auto kernel (faster there).
++HYBRID_FMTS = {int(f) for f in os.environ.get("AEON_MOE_HYBRID_FMTS", "1").split(",") if f}
++# (fmt, proj) -> (BN, BK, num_warps) of the dot kernel
++_DOT_CFG = {(0, 13): (16, 64, 2), (0, 2): (16, 64, 2), (1, 13): (16, 64, 2), (1, 2): (16, 64, 2)}
++_DOT_BK = {(0, 13): int(os.environ.get("AEON_DOT_BK13", "64")), (0, 2): int(os.environ.get("AEON_DOT_BK2", "64")),
++           (1, 13): 64, (1, 2): 64}
+ # (fmt, proj) -> (BN, BK for 1 row, BK for 2 rows, BK for RBMAX rows, num_warps)
+-_AUTO_CFG = {(0, 13): (16, 256, 128, 64, 4), (0, 2): (16, 128, 128, 64, 4),
++_AUTO_CFG = {(0, 13): (16, 256, 128, 64, 2), (0, 2): (16, 128, 128, 64, 2),
+              (1, 13): (16, 128, 64, 32, 4), (1, 2): (16, 64, 64, 32, 4)}
+ _CFG = {
+     (0, 13): (16, 256, 4), (0, 2): (16, 128, 2),
+-    (1, 13): (16, 64, 4), (1, 2): (16, 64, 4),
++    (1, 13): (16, 256, 8), (1, 2): (8, 128, 2),
+ }
+ 
+ 
+@@ -487,13 +712,46 @@ def moe_decode(x, weight, bias, topk, route_scale, w13, w2, fmt, gate_cap, up_ca
+     bucket = torch.empty((E, maxr), dtype=torch.int32, device=dev)
+     logits = torch.empty((T, E), dtype=torch.float32, device=dev)
+     be, bd, nwr = _ROUTER_CFG.get(maxr, (2, 256, 4))
++    done = _counters(dev)
+     _router_logits_kernel[(E // be,)](
+-        x, weight, logits, scratch, active, T, D=D, E=E,
+-        N_ACT=n_act,
+-        BE=be, BD=bd, BT=maxr, num_warps=nwr)
+-    _route_kernel[(T,)](logits, bias, ids, wts, count, bucket, active, nactive,
+-                        E=E, TOPK=topk, SCALE=route_scale, MAXR=maxr, num_warps=TOPK_WARPS)
++        x, weight, logits, scratch, active, T, done, bias, ids, wts, bucket, D=D, E=E,
++        N_ACT=n_act, BE=be, BD=bd, BT=maxr, FUSE_TOPK=FUSE_ROUTER, TOPK=topk,
++        SCALE=route_scale, MAXR=maxr, SORT_TOPK=maxr >= SORT_TOPK_MIN, num_warps=nwr)
++    if not FUSE_ROUTER:
++        _route_kernel[(T,)](logits, bias, ids, wts, count, bucket, active, nactive,
++                            E=E, TOPK=topk, SCALE=route_scale, MAXR=maxr, num_warps=TOPK_WARPS)
+     act = torch.empty((rows, inter), dtype=torch.bfloat16, device=dev)
++    if fmt in HYBRID_FMTS and maxr >= 4 and not EXACT:
++        rbd = max(16, maxr)
++        bn, bk, nw = cfg[(fmt, 13)]
++        _expert_gemv_kernel[(inter // bn, n_act, maxr)](
++            x, w13_w, w13_s, w13_s if w13_g is None else w13_g, act, count, bucket, active,
++            TOPK=topk, N=n13, K=D, OUT_N=inter, MAXR=maxr, FMT=fmt, GATED=True, GATHER=True,
++            HW_FP8=HW_FP8, GATE_CAP=gate_cap, UP_CAP=up_cap, BN=bn, BK=bk, ROUND=False,
++            SKIP_MIN=DOT_MIN, num_warps=nw)
++        bn, bkd, nw = _DOT_CFG[(fmt, 13)]
++        _expert_dot_kernel[(inter // bn, n_act)](
++            x, w13_w, w13_s, w13_s if w13_g is None else w13_g, act, count, bucket, active,
++            TOPK=topk, N=n13, K=D, OUT_N=inter, MAXR=maxr, FMT=fmt, GATED=True, GATHER=True,
++            HW_FP8=HW_FP8, GATE_CAP=gate_cap, UP_CAP=up_cap, RBD=rbd, BN=bn, BKD=bkd,
++            DOT_MIN=DOT_MIN, num_warps=nw)
++        down = torch.empty((rows, D), dtype=torch.bfloat16, device=dev)
++        bn, bk, nw = cfg[(fmt, 2)]
++        _expert_gemv_kernel[(D // bn, n_act, maxr)](
++            act, w2_w, w2_s, w2_s if w2_g is None else w2_g, down, count, bucket, active,
++            TOPK=topk, N=D, K=inter, OUT_N=D, MAXR=maxr, FMT=fmt, GATED=False, GATHER=False,
++            HW_FP8=HW_FP8, GATE_CAP=gate_cap, UP_CAP=up_cap, BN=bn, BK=bk, ROUND=False,
++            SKIP_MIN=DOT_MIN, num_warps=nw)
++        bn, bkd, nw = _DOT_CFG[(fmt, 2)]
++        _expert_dot_kernel[(D // bn, n_act)](
++            act, w2_w, w2_s, w2_s if w2_g is None else w2_g, down, count, bucket, active,
++            TOPK=topk, N=D, K=inter, OUT_N=D, MAXR=maxr, FMT=fmt, GATED=False, GATHER=False,
++            HW_FP8=HW_FP8, GATE_CAP=gate_cap, UP_CAP=up_cap, RBD=rbd, BN=bn, BKD=bkd,
++            DOT_MIN=DOT_MIN, Ctr=done[16:], Wts=wts, Final=out, T=T,
++            FUSE_COMBINE=FUSE_COMBINE, num_warps=nw)
++        if not FUSE_COMBINE:
++            _combine_kernel[(T, D // 256)](down, wts, out, TOPK=topk, D=D, BD=256, num_warps=4)
++        return out, ids, wts
+     if AUTO_ROWS and maxr >= 4 and not EXACT:
+         rbmax = min(maxr, AUTO_RBMAX)
+         bn, bk1, bk2, bkm, nw = _AUTO_CFG[(fmt, 13)]
+@@ -501,15 +759,19 @@ def moe_decode(x, weight, bias, topk, route_scale, w13, w2, fmt, gate_cap, up_ca
+             x, w13_w, w13_s, w13_s if w13_g is None else w13_g, act, count, bucket, active,
+             TOPK=topk, N=n13, K=D, OUT_N=inter, MAXR=maxr, FMT=fmt, GATED=True, GATHER=True,
+             HW_FP8=HW_FP8, GATE_CAP=gate_cap, UP_CAP=up_cap, RBMAX=rbmax, BN=bn,
+-            BK1=bk1, BK2=bk2, BKM=bkm, num_warps=nw)
++            BK1=bk1, BK2=bk2, BKM=bkm, DOT=AUTO_DOT, RBD=max(16, maxr), BKD=_DOT_BK[(fmt, 13)], DOT_MIN=DOT_MIN,
++            num_warps=nw)
+         down = torch.empty((rows, D), dtype=torch.bfloat16, device=dev)
+         bn, bk1, bk2, bkm, nw = _AUTO_CFG[(fmt, 2)]
+         _expert_gemv_auto_kernel[(D // bn, n_act)](
+             act, w2_w, w2_s, w2_s if w2_g is None else w2_g, down, count, bucket, active,
+             TOPK=topk, N=D, K=inter, OUT_N=D, MAXR=maxr, FMT=fmt, GATED=False, GATHER=False,
+             HW_FP8=HW_FP8, GATE_CAP=gate_cap, UP_CAP=up_cap, RBMAX=rbmax, BN=bn,
+-            BK1=bk1, BK2=bk2, BKM=bkm, num_warps=nw)
+-        _combine_kernel[(T, D // 256)](down, wts, out, TOPK=topk, D=D, BD=256, num_warps=4)
++            BK1=bk1, BK2=bk2, BKM=bkm, DOT=AUTO_DOT, RBD=max(16, maxr), BKD=_DOT_BK[(fmt, 2)], DOT_MIN=DOT_MIN,
++            NActive=nactive, Ctr=done[16:], Wts=wts, Final=out,
++            T=T, FUSE_COMBINE=FUSE_COMBINE, num_warps=nw)
++        if not FUSE_COMBINE:
++            _combine_kernel[(T, D // 256)](down, wts, out, TOPK=topk, D=D, BD=256, num_warps=4)
+         return out, ids, wts
+     rb = _RB.get((fmt, maxr), 1) if not EXACT else 1
+     bn, bk, nw = cfg.get((fmt, 13, rb), cfg[(fmt, 13)]) if rb > 1 else cfg[(fmt, 13)]
+@@ -534,6 +796,9 @@ def moe_decode(x, weight, bias, topk, route_scale, w13, w2, fmt, gate_cap, up_ca
+         _expert_gemv_kernel[(D // bn, n_act, maxr)](
+             act, w2_w, w2_s, w2_s if w2_g is None else w2_g, down, count, bucket, active,
+             TOPK=topk, N=D, K=inter, OUT_N=D, MAXR=maxr, FMT=fmt, GATED=False, GATHER=False,
+-            HW_FP8=HW_FP8, GATE_CAP=gate_cap, UP_CAP=up_cap, BN=bn, BK=bk, ROUND=EXACT, num_warps=nw)
+-    _combine_kernel[(T, D // 256)](down, wts, out, TOPK=topk, D=D, BD=256, num_warps=4)
++            HW_FP8=HW_FP8, GATE_CAP=gate_cap, UP_CAP=up_cap, BN=bn, BK=bk, ROUND=EXACT,
++            Ctr=done[16:], Wts=wts, Final=out, T=T, FUSE_COMBINE=FUSE_COMBINE and rb == 1,
++            num_warps=nw)
++    if not (FUSE_COMBINE and rb == 1):
++        _combine_kernel[(T, D // 256)](down, wts, out, TOPK=topk, D=D, BD=256, num_warps=4)
+     return out, ids, wts
+-- 
+2.53.0
+

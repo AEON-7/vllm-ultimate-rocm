@@ -10,3 +10,4 @@ export VLLM_ROCM_USE_AITER=0
 export HSA_ENABLE_SDMA=0
 unset PYTORCH_CUDA_ALLOC_CONF PYTORCH_HIP_ALLOC_CONF PYTORCH_ALLOC_CONF
 export TRITON_CACHE_DIR=~/inkling/engines/aeon-cleanroom/.triton-cache
+export GPU_MAX_HW_QUEUES=1  # AEON M2: one HW queue per device; cross-queue barrier polling stalls graph dispatch on gfx12
