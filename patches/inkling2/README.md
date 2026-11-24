@@ -25,6 +25,8 @@ git am /path/to/patches/inkling2/*.patch
 | 0012 | M2: K/V tap projections in the qkvr GEMV launch; one message mix per loop pass | original AEON work | Apache-2.0 |
 | 0013 | AEON per-request multi-variant o_proj ablation (same change as PR #3's 0007, renumbered to apply on 0012) | original AEON work | Apache-2.0 |
 | 0014 | M2: batch-invariant MoE mode, on automatically for ablation variant servers | original AEON work | Apache-2.0 |
+| 0015 | M3 (opt-in): DSpark draft KV write via the cache op on ROCm | original AEON work | Apache-2.0 |
+| 0016 | M3 (opt-in): DSpark draft dense layers on the AEON small-M GEMV | original AEON work | Apache-2.0 |
 
 Clean room: no code, binaries or images from vllm-redshift were read or used.
 Sources were upstream vLLM (Apache-2.0), the model's HF config and
@@ -39,6 +41,12 @@ pins from upstream `docker/Dockerfile.rocm_base`), `tools/env.sh`, then
 Never set `PYTORCH_HIP_ALLOC_CONF=expandable_segments`. `tools/env.sh` sets
 `GPU_MAX_HW_QUEUES=1` (M2: one HW queue per device; graph dispatch stalls on
 cross-queue barriers on gfx12 otherwise).
+
+## M3 DSpark (opt-in, off by default)
+
+Speculative decoding only runs with an explicit `--speculative-config`;
+see `docs/inkling2-rocm/M3_RESULTS.md` for numbers and the recommended
+config. `AEON_DSPARK_GEMV=0` puts the draft back on torch linear.
 
 ## M2 decode switches (all default on; set to 0 to fall back)
 

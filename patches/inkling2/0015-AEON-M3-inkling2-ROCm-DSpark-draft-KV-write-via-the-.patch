@@ -1,0 +1,43 @@
+From 4d43fb64f5015dbe75af5e22c9521ae5afbd8f5c Mon Sep 17 00:00:00 2001
+From: AEON-7 <aeon-7@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 22:51:07 -0600
+Subject: [PATCH 15/16] [AEON M3] inkling2 ROCm: DSpark draft KV write via the
+ cache op (no flash-attn varlen module on ROCm)
+
+flash_attn.py only imports reshape_and_cache_flash when flash-attn varlen is available, which it is not on ROCm, so the draft layers hit a NameError. Call vllm._custom_ops.reshape_and_cache_flash with the same (B, H, N, 2*D) cache layout. Original AEON work (clean room), Apache-2.0.
+---
+ vllm/models/inkling2/amd/dspark.py | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/models/inkling2/amd/dspark.py b/vllm/models/inkling2/amd/dspark.py
+index fbe715017..ee3232dfc 100644
+--- a/vllm/models/inkling2/amd/dspark.py
++++ b/vllm/models/inkling2/amd/dspark.py
+@@ -11,6 +11,7 @@ from typing import cast
+ import torch
+ from torch import nn
+ 
++from vllm import _custom_ops
+ from vllm.config import VllmConfig, get_current_vllm_config
+ from vllm.distributed import (
+     get_tensor_model_parallel_world_size,
+@@ -146,7 +147,15 @@ class Inkling2DraftSelfAttention(nn.Module):
+         self, k: torch.Tensor, v: torch.Tensor, slot_mapping: torch.Tensor
+     ) -> None:
+         impl = cast(FlashAttentionImpl, self.attn.impl)
+-        impl.do_kv_cache_update(self.attn, k, v, self.attn.kv_cache, slot_mapping)
++        # AEON-7: ROCm builds have no flash-attn varlen module, so the backend's
++        # `reshape_and_cache_flash` import is absent; call the cache op
++        # directly (same (B, H, N, 2*D) layout as `do_kv_cache_update`).
++        kv_cache = self.attn.kv_cache
++        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_dim, dim=-1)
++        _custom_ops.reshape_and_cache_flash(
++            k, v, key_cache, value_cache, slot_mapping, impl.kv_cache_dtype,
++            self.attn._k_scale, self.attn._v_scale,
++        )
+ 
+     def forward(
+         self, positions: torch.Tensor, x: torch.Tensor, cos_sin_cache: torch.Tensor
+-- 
+2.53.0
+
