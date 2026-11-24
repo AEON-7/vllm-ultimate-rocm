@@ -1,0 +1,51 @@
+From c1d310e97f28f2a20916d4fb7bbb1435d0652c5f Mon Sep 17 00:00:00 2001
+From: AEON-7 <aeon-7@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 22:46:49 -0600
+Subject: [PATCH 14/14] [AEON M2] inkling2 gfx12: batch-invariant MoE mode for
+ ablation variant servers
+
+The M2 multi-row expert paths (auto dot path, MXFP8 hybrid) reduce in an
+order that depends on how many rows of the step picked the same expert, so
+a request's numerics changed with batch composition and mixed-variant
+batches no longer matched same-variant batches bitwise (6-14/20 exact).
+
+AEON_BATCH_INVARIANT=1 keeps every routed row on the per-row expert GEMV
+(fused combine sums each token's experts in a fixed order). It defaults on
+when AEON_VARIANT_DIR is set (the only way per-request variants exist) and
+off otherwise, so default serving is unchanged.
+
+Validation (eager, R9700): mixed batch of stock + 9 variants vs
+same-variant batches at the same row position: 200/200 bitwise exact
+(was 6-14/20 per variant on M2 multi-row paths). Cost on the variant
+server: stock bs8 243.1 -> 213.2 tok/s, bs1 39.1 -> 40.0; variants vs
+stock in that mode: 8 variants 211.8 (-0.7%), bs1 38.6 (-3.5%).
+Hook point unchanged: HOOKS.oproj right after o_proj.
+Original AEON work (clean room), Apache-2.0.
+---
+ vllm/models/inkling2/amd/ops/moe_decode.py | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/vllm/models/inkling2/amd/ops/moe_decode.py b/vllm/models/inkling2/amd/ops/moe_decode.py
+index 8af31c2ad..eb513a318 100644
+--- a/vllm/models/inkling2/amd/ops/moe_decode.py
++++ b/vllm/models/inkling2/amd/ops/moe_decode.py
+@@ -698,6 +698,16 @@ DOT_MIN = int(os.environ.get("AEON_MOE_DOT_MIN", "3"))
+ # single auto kernel, whose combined code ran the 1-row case slower.
+ # Per format: MXFP8 uses the hybrid, NVFP4 the auto kernel (faster there).
+ HYBRID_FMTS = {int(f) for f in os.environ.get("AEON_MOE_HYBRID_FMTS", "1").split(",") if f}
++# AEON_BATCH_INVARIANT=1: per-row expert GEMV only, so a row's numerics never
++# depend on how many other rows picked the same expert (the multi-row dot /
++# hybrid paths reduce in a count-dependent order). Default on for ablation
++# variant servers (AEON_VARIANT_DIR), where mixed batches must match
++# same-variant batches exactly; costs some bs8 decode speed.
++BATCH_INVARIANT = os.environ.get(
++    "AEON_BATCH_INVARIANT", "1" if os.environ.get("AEON_VARIANT_DIR") else "0") == "1"
++if BATCH_INVARIANT:
++    HYBRID_FMTS = set()
++    AUTO_ROWS = False
+ # (fmt, proj) -> (BN, BK, num_warps) of the dot kernel
+ _DOT_CFG = {(0, 13): (16, 64, 2), (0, 2): (16, 64, 2), (1, 13): (16, 64, 2), (1, 2): (16, 64, 2)}
+ _DOT_BK = {(0, 13): int(os.environ.get("AEON_DOT_BK13", "64")), (0, 2): int(os.environ.get("AEON_DOT_BK2", "64")),
+-- 
+2.53.0
+

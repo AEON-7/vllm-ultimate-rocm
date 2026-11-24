@@ -73,3 +73,28 @@ bit-exact or with the KL harness. The research hook point is unchanged:
 
 DSpark drafter from the bundled `mtp.safetensors` in the loop model, gates
 >= 86 tok/s single, >= 316 tok/s at 8, output identical to non-spec greedy.
+
+## Ablation variants on M2 (patches 0013-0014)
+
+Patch 0013 is the per-request multi-variant o_proj ablation from PR #3. On
+the M2 kernels a mixed batch (stock + 9 variants, one per row) no longer
+matched same-variant batches at the same row position: 6-14 of 20 greedy
+generations exact per variant, stock rows included. The multi-row expert
+paths (tensor-core dot path, MXFP8 hybrid) reduce in an order that depends
+on how many rows picked the same expert, so a row's numerics depended on its
+neighbours' routing.
+
+Patch 0014 adds `AEON_BATCH_INVARIANT`: every routed row goes through the
+per-row expert GEMV. It is on by default whenever `AEON_VARIANT_DIR` is set
+(the only way per-request variants exist) and off otherwise, so default
+serving keeps the numbers above.
+
+| Variant server (eager, R9700) | M2 multi-row MoE | Batch-invariant (default with variants) |
+|---|---|---|
+| Mixed batch vs same-variant batch, exact | 6-14 / 20 per variant | 20 / 20 for all 10 (200 / 200) |
+| Stock bs8 tok/s | 243.1 | 213.2 |
+| 8 different variants bs8 tok/s | 239.0 | 211.8 (-0.7% vs stock) |
+| Stock / variant bs1 tok/s | 39.1 / 37.9 | 40.0 / 38.6 |
+
+M1 eager was 135.5 tok/s at bs8 for the same test. Variants are eager only
+for now. Raw results: `tools/abl_results_m2/`.

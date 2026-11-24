@@ -23,6 +23,8 @@ git am /path/to/patches/inkling2/*.patch
 | 0010 | M2: fused router + sort top-k, dot-path MoE, MXFP8 hybrid decode, fused combine/norm, split-KV merge in attention | original AEON work | Apache-2.0 |
 | 0011 | M2: static short conv fused with the following AttnRes mix (T<=8); MoE T=1 retune | original AEON work | Apache-2.0 |
 | 0012 | M2: K/V tap projections in the qkvr GEMV launch; one message mix per loop pass | original AEON work | Apache-2.0 |
+| 0013 | AEON per-request multi-variant o_proj ablation (same change as PR #3's 0007, renumbered to apply on 0012) | original AEON work | Apache-2.0 |
+| 0014 | M2: batch-invariant MoE mode, on automatically for ablation variant servers | original AEON work | Apache-2.0 |
 
 Clean room: no code, binaries or images from vllm-redshift were read or used.
 Sources were upstream vLLM (Apache-2.0), the model's HF config and
@@ -42,7 +44,9 @@ cross-queue barriers on gfx12 otherwise).
 
 `AEON_GEMV`, `AEON_FUSE_TAPS` (+ `AEON_FUSE_TAPS_MAX_M`, default 4),
 `AEON_BATCH_MESSAGES`, `AEON_FUSE_SCONV_MIX`, `AEON_FUSE_SPLIT_COMBINE`,
-`AEON_MOE_HYBRID_FMTS`. See `docs/inkling2-rocm/M2_RESULTS.md`.
+`AEON_MOE_HYBRID_FMTS`. `AEON_BATCH_INVARIANT` (default on only when
+`AEON_VARIANT_DIR` is set): per-row expert GEMV so each request's numerics
+are independent of batch composition. See `docs/inkling2-rocm/M2_RESULTS.md`.
 
 ## AEON hooks (patch 0006), all off by default
 

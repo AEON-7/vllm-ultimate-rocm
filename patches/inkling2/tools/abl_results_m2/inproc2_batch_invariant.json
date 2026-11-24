@@ -1,0 +1,157 @@
+{
+ "A": {
+  "stock": {
+   "same_position": {
+    "exact": 20,
+    "n": 20,
+    "kl_mean": 0.0,
+    "first_div": []
+   },
+   "engine_position_noise": {
+    "exact": 10,
+    "n": 18
+   }
+  },
+  "v_eq": {
+   "same_position": {
+    "exact": 20,
+    "n": 20,
+    "kl_mean": 0.0,
+    "first_div": []
+   },
+   "engine_position_noise": {
+    "exact": 3,
+    "n": 18
+   }
+  },
+  "v_pass": {
+   "same_position": {
+    "exact": 20,
+    "n": 20,
+    "kl_mean": 0.0,
+    "first_div": []
+   },
+   "engine_position_noise": {
+    "exact": 5,
+    "n": 18
+   }
+  },
+  "v_s0": {
+   "same_position": {
+    "exact": 20,
+    "n": 20,
+    "kl_mean": 0.0,
+    "first_div": []
+   },
+   "engine_position_noise": {
+    "exact": 1,
+    "n": 18
+   }
+  },
+  "v_s1": {
+   "same_position": {
+    "exact": 20,
+    "n": 20,
+    "kl_mean": 0.0,
+    "first_div": []
+   },
+   "engine_position_noise": {
+    "exact": 7,
+    "n": 18
+   }
+  },
+  "v_s2": {
+   "same_position": {
+    "exact": 20,
+    "n": 20,
+    "kl_mean": 0.0,
+    "first_div": []
+   },
+   "engine_position_noise": {
+    "exact": 7,
+    "n": 18
+   }
+  },
+  "v_s3": {
+   "same_position": {
+    "exact": 20,
+    "n": 20,
+    "kl_mean": 0.0,
+    "first_div": []
+   },
+   "engine_position_noise": {
+    "exact": 0,
+    "n": 18
+   }
+  },
+  "v_s4": {
+   "same_position": {
+    "exact": 20,
+    "n": 20,
+    "kl_mean": 0.0,
+    "first_div": []
+   },
+   "engine_position_noise": {
+    "exact": 2,
+    "n": 18
+   }
+  },
+  "v_r2": {
+   "same_position": {
+    "exact": 20,
+    "n": 20,
+    "kl_mean": 0.0,
+    "first_div": []
+   },
+   "engine_position_noise": {
+    "exact": 3,
+    "n": 18
+   }
+  },
+  "v_r3": {
+   "same_position": {
+    "exact": 20,
+    "n": 20,
+    "kl_mean": 0.0,
+    "first_div": []
+   },
+   "engine_position_noise": {
+    "exact": 5,
+    "n": 18
+   }
+  }
+ },
+ "B": {
+  "rows": 8,
+  "same_input": {
+   "req_vs_ablate": true,
+   "req_vs_overlay": true
+  },
+  "req_vs_fp32_reference": {
+   "max_ulps": 0.0,
+   "frac_bitwise_equal": 1.0
+  },
+  "req_vs_ablate_bf16": {
+   "max_ulps": 3882.0,
+   "frac_bitwise_equal": 0.9356553554534912
+  },
+  "req_vs_overlay": {
+   "max_ulps": 1982.0,
+   "frac_bitwise_equal": 0.5453016757965088
+  },
+  "ablate_vs_overlay": {
+   "max_ulps": 6.152871777363771e+35,
+   "frac_bitwise_equal": 0.5419921875
+  },
+  "stock_vs_req": {
+   "max_ulps": 2932924.0,
+   "frac_bitwise_equal": 0.1379665732383728
+  },
+  "residual_r_dot_y": {
+   "stock": 0.5620827078819275,
+   "req": 0.0009931852109730244,
+   "ablate": 0.0017253381665796041,
+   "overlay": 0.0006994488649070263
+  }
+ }
+}

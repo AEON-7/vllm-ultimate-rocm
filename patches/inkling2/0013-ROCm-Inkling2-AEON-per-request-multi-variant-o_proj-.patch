@@ -1,0 +1,710 @@
+From 70e97ec3cf466840c69a9631c8129cf0823b6d0f Mon Sep 17 00:00:00 2001
+From: AEON-7 <aeon-7@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 20:09:33 -0600
+Subject: [PATCH 13/14] [ROCm][Inkling2] AEON per-request multi-variant o_proj
+ ablation
+
+Original AEON work. Off (zero cost) unless AEON_VARIANT_DIR is set.
+
+One server holds a bank of registered ablation variants and applies the
+right one to every token of every request in a mixed batch, so an
+abliteration screen runs many edits concurrently with no restart.
+
+- aeon_variants.py: variant files (dirs [D] / [24,D] / [48,D] / [48,K,D],
+  scales [48] / [48,K]), worker-side bank with slot table, per-step
+  per-token variant map built from the batch request order, and a fused
+  Triton kernel after wo_ud that applies y <- y - s r (r . y) for K
+  directions in fp32 per row, in place. Stock rows are never touched; no
+  launch when no request in the step uses a variant.
+- model_runner: record each request variant on add, build the token map
+  after prepare_attn. Refuses cudagraph modes (eager only for now).
+- OpenAI chat/completions: "aeon_variant" field (or vllm_xargs), checked
+  against the registry (400 if unknown) and folded into the prefix-cache
+  salt so KV is never shared across variants.
+- HTTP: GET/POST /aeon/variants, DELETE /aeon/variants/{name}.
+
+Signed-off-by: AEON-7 <aeon-7@users.noreply.github.com>
+---
+ .../launchers/api_server/routers.py           |   6 +
+ vllm/entrypoints/openai/aeon_variants_api.py  |  73 +++
+ .../openai/chat_completion/protocol.py        |   8 +
+ .../entrypoints/openai/completion/protocol.py |   8 +
+ vllm/models/inkling2/amd/aeon_hooks.py        |  14 +-
+ vllm/models/inkling2/amd/aeon_variants.py     | 431 ++++++++++++++++++
+ vllm/v1/worker/gpu/model_runner.py            |  13 +
+ 7 files changed, 552 insertions(+), 1 deletion(-)
+ create mode 100644 vllm/entrypoints/openai/aeon_variants_api.py
+ create mode 100644 vllm/models/inkling2/amd/aeon_variants.py
+
+diff --git a/vllm/entrypoints/launchers/api_server/routers.py b/vllm/entrypoints/launchers/api_server/routers.py
+index 55eb70111..9774df3b6 100644
+--- a/vllm/entrypoints/launchers/api_server/routers.py
++++ b/vllm/entrypoints/launchers/api_server/routers.py
+@@ -25,6 +25,12 @@ def register_api_routers(
+ 
+     register_models_api_router(app)
+ 
++    from vllm.entrypoints.openai.aeon_variants_api import (
++        attach_router as register_aeon_variants_router,
++    )
++
++    register_aeon_variants_router(app)
++
+     from vllm.entrypoints.generate.structured_decisions.api_router import (
+         register_structured_decisions_api_router,
+     )
+diff --git a/vllm/entrypoints/openai/aeon_variants_api.py b/vllm/entrypoints/openai/aeon_variants_api.py
+new file mode 100644
+index 000000000..67c26fe0e
+--- /dev/null
++++ b/vllm/entrypoints/openai/aeon_variants_api.py
+@@ -0,0 +1,73 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright 2026 AEON-7
++# Original AEON work.
++"""HTTP API for AEON per-request ablation variants (only mounted when
++AEON_VARIANT_DIR is set).
++
++GET    /aeon/variants          list registered variants
++POST   /aeon/variants          register or replace one:
++       {"name": "v1", "dirs": [...], "scales": [...]}  (see aeon_variants)
++       or {"name": "v1", "path": "/server/side/file.safetensors"}
++DELETE /aeon/variants/{name}   remove one
++Requests then pick a variant with "aeon_variant": "v1" (or "stock").
++"""
++
++from typing import Any
++
++from fastapi import APIRouter, FastAPI, HTTPException
++from pydantic import BaseModel
++
++from vllm.models.inkling2.amd import aeon_variants as av
++
++router = APIRouter()
++
++
++class RegisterVariantRequest(BaseModel):
++    name: str
++    dirs: Any = None
++    scales: Any = None
++    path: str | None = None
++    replace: bool = True
++
++
++@router.get("/aeon/variants")
++async def get_variants() -> dict:
++    return {"variants": av.list_variants()}
++
++
++@router.post("/aeon/variants")
++async def register_variant(req: RegisterVariantRequest) -> dict:
++    import torch
++
++    try:
++        name = av.normalize_name(req.name)
++        if name is None:
++            raise ValueError("'stock' is reserved for the unedited model")
++        if not req.replace and __import__("os").path.exists(av.variant_path(name)):
++            raise ValueError(f"variant {name!r} exists and replace=false")
++        if req.path:
++            dirs, scales = av.read_variant(req.path)
++        elif req.dirs is not None and req.scales is not None:
++            dirs = torch.tensor(req.dirs, dtype=torch.float32)
++            scales = torch.tensor(req.scales, dtype=torch.float32)
++        else:
++            raise ValueError("give either path or dirs and scales")
++        return av.save_variant(name, dirs, scales)
++    except (ValueError, KeyError, RuntimeError, FileNotFoundError) as e:
++        raise HTTPException(status_code=400, detail=str(e)) from e
++
++
++@router.delete("/aeon/variants/{name}")
++async def remove_variant(name: str) -> dict:
++    try:
++        ok = av.delete_variant(name)
++    except ValueError as e:
++        raise HTTPException(status_code=400, detail=str(e)) from e
++    if not ok:
++        raise HTTPException(status_code=404, detail=f"no variant {name!r}")
++    return {"deleted": name}
++
++
++def attach_router(app: FastAPI) -> None:
++    if av.variant_dir():
++        app.include_router(router)
+diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
+index 3c485954e..a22f6b6de 100644
+--- a/vllm/entrypoints/openai/chat_completion/protocol.py
++++ b/vllm/entrypoints/openai/chat_completion/protocol.py
+@@ -575,6 +575,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
+     def apply_return_mm_kwargs_alias(cls, data: Any) -> Any:
+         return resolve_return_mm_kwargs_alias(data)
+ 
++    @model_validator(mode="before")
++    @classmethod
++    def aeon_variant_field(cls, data: Any) -> Any:
++        # AEON: per-request ablation variant -> vllm_xargs + cache salt.
++        from vllm.models.inkling2.amd.aeon_variants import request_hook
++
++        return request_hook(data)
++
+     @model_validator(mode="before")
+     @classmethod
+     def check_cache_salt_support(cls, data: Any) -> Any:
+diff --git a/vllm/entrypoints/openai/completion/protocol.py b/vllm/entrypoints/openai/completion/protocol.py
+index 27b05d379..9d3be1876 100644
+--- a/vllm/entrypoints/openai/completion/protocol.py
++++ b/vllm/entrypoints/openai/completion/protocol.py
+@@ -447,6 +447,14 @@ class CompletionRequest(OpenAIBaseModel):
+     def apply_return_mm_kwargs_alias(cls, data: Any) -> Any:
+         return resolve_return_mm_kwargs_alias(data)
+ 
++    @model_validator(mode="before")
++    @classmethod
++    def aeon_variant_field(cls, data: Any) -> Any:
++        # AEON: per-request ablation variant -> vllm_xargs + cache salt.
++        from vllm.models.inkling2.amd.aeon_variants import request_hook
++
++        return request_hook(data)
++
+     @model_validator(mode="before")
+     @classmethod
+     def check_cache_salt_support(cls, data: Any) -> Any:
+diff --git a/vllm/models/inkling2/amd/aeon_hooks.py b/vllm/models/inkling2/amd/aeon_hooks.py
+index 6e7d3693a..ea0eef4bf 100644
+--- a/vllm/models/inkling2/amd/aeon_hooks.py
++++ b/vllm/models/inkling2/amd/aeon_hooks.py
+@@ -28,6 +28,11 @@ AEON_ABLATE=/path/edit.safetensors
+     Keys "dirs" [48, D] (unit-normalised on load) and "scales" [48]: at layer
+     application a, o_proj output y becomes y - scales[a] * r_a (r_a . y), the
+     runtime form of W' = (I - s r r^T) W, with a per-pass scale for the loop.
++
++AEON_VARIANT_DIR=/path
++    Per-request multi-variant ablation (see aeon_variants.py): a bank of
++    registered rank-K edits applied per token right after o_proj, selected
++    per request with extra_args["aeon_variant"]. Eager mode only.
+ """
+ 
+ from __future__ import annotations
+@@ -39,6 +44,8 @@ import torch
+ 
+ from vllm.logger import init_logger
+ 
++from .aeon_variants import VARIANTS
++
+ logger = init_logger(__name__)
+ 
+ 
+@@ -99,7 +106,8 @@ class AeonHooks:
+             (os.environ.get("AEON_CAPTURE_WHAT") or "resid,oproj_in,oproj_out").split(",")
+         )
+         self.ablate_path = os.environ.get("AEON_ABLATE") or None
+-        self.enabled = bool(self.capture_dir or self.ablate_path)
++        self.variants = VARIANTS if VARIANTS.enabled else None
++        self.enabled = bool(self.capture_dir or self.ablate_path or self.variants)
+         self.visit = -1
+         self.rows: torch.Tensor | None = None
+         self.step = 0
+@@ -174,6 +182,8 @@ class AeonHooks:
+             if s != 0.0:
+                 r = self._dirs[self.visit].to(y.dtype)
+                 y = y - s * (y @ r)[:, None] * r[None]
++        if self.variants is not None:
++            y = self.variants.apply(y, self.visit)
+         if self._keep("oproj_in"):
+             self._put("oproj_in", attn_out)
+         if self._keep("oproj_out"):
+@@ -185,6 +195,8 @@ class AeonHooks:
+             self._put("resid", x)
+ 
+     def end_step(self) -> None:
++        if self.variants is not None:
++            self.variants.end_step()
+         if self.capture_dir and self.rows is not None and self.buf:
+             path = os.path.join(self.capture_dir, f"step{self.step:06d}_pid{os.getpid()}.pt")
+             torch.save({**self.meta, **self.buf}, path)
+diff --git a/vllm/models/inkling2/amd/aeon_variants.py b/vllm/models/inkling2/amd/aeon_variants.py
+new file mode 100644
+index 000000000..ba5ec6736
+--- /dev/null
++++ b/vllm/models/inkling2/amd/aeon_variants.py
+@@ -0,0 +1,431 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright 2026 AEON-7
++# Original AEON work.
++"""Per-request multi-variant o_proj ablation for Inkling-2-Mini on AMD.
++
++One server holds a bank of registered *variants* and applies the right one to
++every token of every request in a mixed batch, so an abliteration screen runs
++many edits concurrently with no restart per variant. Off (zero cost) unless
++AEON_VARIANT_DIR is set.
++
++A variant is a stack of K unit directions and scales per layer application
++a in 0..47 (looped layers 6..17 count once per pass: a = 6 + 12 * pass +
++(layer - 6)). Right after attention o_proj (wo_ud) of application a, each
++token row y of a request using the variant becomes
++
++    for k in 0..K-1:  y <- y - s[a, k] * r[a, k] (r[a, k] . y)
++
++i.e. the runtime form of W' = (I - s_{K-1} r r^T) ... (I - s_0 r r^T) W. With
++K = 1 this is exactly the AEON_ABLATE / baked-overlay edit W' = (I - s r r^T) W.
++Math is fp32 per row and the row is rounded to bf16 once. Rows of stock
++requests (variant 0) are never touched, so stock output is bit-identical.
++
++Variant files: AEON_VARIANT_DIR/<name>.safetensors with
++    dirs    [D] (shared), [24, D] (per layer), [48, D] (per application) or
++            [48, K, D] (rank K per application); unit-normalised on load
++    scales  [48] or [48, K] (float)
++Names match [A-Za-z0-9][A-Za-z0-9_.-]{0,63}; "stock" is reserved (variant 0).
++The worker rescans the directory at most every AEON_VARIANT_RESCAN_S seconds
++(default 1.0) and immediately when a request names an unknown variant.
++Requests select a variant with SamplingParams.extra_args["aeon_variant"]
++(OpenAI API: top-level "aeon_variant" or vllm_xargs.aeon_variant).
++"""
++
++from __future__ import annotations
++
++import hashlib
++import os
++import re
++import time
++from typing import Any
++
++import numpy as np
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++NUM_APPS = 48
++NUM_LAYERS = 24
++LOOP_START, LOOP_LEN, LOOP_PASSES = 6, 12, 3
++NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}$")
++STOCK_NAMES = (None, "", "stock", "0", 0)
++
++
++def app_to_layer(app: int) -> int:
++    loop_end = LOOP_START + LOOP_LEN * LOOP_PASSES
++    if app < LOOP_START:
++        return app
++    if app < loop_end:
++        return LOOP_START + (app - LOOP_START) % LOOP_LEN
++    return app - LOOP_LEN * (LOOP_PASSES - 1)
++
++
++def variant_dir() -> str | None:
++    return os.environ.get("AEON_VARIANT_DIR") or None
++
++
++def normalize_name(name: Any) -> str | None:
++    """None for stock, else the validated variant name."""
++    if name in STOCK_NAMES:
++        return None
++    if not isinstance(name, str) or not NAME_RE.match(name):
++        raise ValueError(f"invalid aeon_variant name {name!r}")
++    return name
++
++
++def variant_path(name: str, root: str | None = None) -> str:
++    root = root or variant_dir()
++    assert root, "AEON_VARIANT_DIR is not set"
++    return os.path.join(root, f"{name}.safetensors")
++
++
++def canonicalize(dirs: torch.Tensor, scales: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    """-> dirs [48, K, D] fp32 unit rows, scales [48, K] fp32."""
++    dirs = torch.as_tensor(dirs).float()
++    scales = torch.as_tensor(scales).float()
++    if dirs.dim() == 1:
++        dirs = dirs.expand(NUM_APPS, dirs.shape[0])
++    if dirs.dim() == 2:
++        if dirs.shape[0] == NUM_LAYERS:
++            dirs = dirs[[app_to_layer(a) for a in range(NUM_APPS)]]
++        if dirs.shape[0] != NUM_APPS:
++            raise ValueError(f"dirs must be [D], [24, D], [48, D] or [48, K, D], got {tuple(dirs.shape)}")
++        dirs = dirs[:, None, :]
++    if dirs.dim() != 3 or dirs.shape[0] != NUM_APPS:
++        raise ValueError(f"dirs must be [D], [24, D], [48, D] or [48, K, D], got {tuple(dirs.shape)}")
++    k = dirs.shape[1]
++    if scales.dim() == 1:
++        if scales.shape[0] != NUM_APPS:
++            raise ValueError(f"scales must be [48] or [48, K], got {tuple(scales.shape)}")
++        scales = scales[:, None].expand(NUM_APPS, k)
++    if tuple(scales.shape) != (NUM_APPS, k):
++        raise ValueError(f"scales must be [48] or [48, {k}], got {tuple(scales.shape)}")
++    if not (torch.isfinite(dirs).all() and torch.isfinite(scales).all()):
++        raise ValueError("dirs/scales must be finite")
++    nrm = dirs.norm(dim=-1, keepdim=True)
++    dirs = torch.where(nrm > 1e-12, dirs / nrm.clamp_min(1e-12), torch.zeros_like(dirs))
++    scales = torch.where(nrm[..., 0] > 1e-12, scales, torch.zeros_like(scales))
++    return dirs.contiguous(), scales.contiguous()
++
++
++def save_variant(name: str, dirs: torch.Tensor, scales: torch.Tensor, root: str | None = None) -> dict:
++    """Validate and atomically write a variant file. Returns its summary."""
++    from safetensors.torch import save_file
++
++    name = normalize_name(name)
++    if name is None:
++        raise ValueError("'stock' is reserved for the unedited model")
++    d, s = canonicalize(dirs, scales)
++    path = variant_path(name, root)
++    os.makedirs(os.path.dirname(path), exist_ok=True)
++    tmp = f"{path}.tmp{os.getpid()}"
++    save_file({"dirs": d, "scales": s}, tmp)
++    os.replace(tmp, path)
++    return summarize(name, d, s, path)
++
++
++def summarize(name: str, d: torch.Tensor, s: torch.Tensor, path: str) -> dict:
++    apps = [a for a in range(NUM_APPS) if bool((s[a] != 0).any())]
++    return {"name": name, "rank": int(d.shape[1]), "hidden": int(d.shape[2]),
++            "nonzero_apps": apps, "salt": file_salt(path)}
++
++
++def file_salt(path: str) -> str:
++    st = os.stat(path)
++    return hashlib.sha1(f"{st.st_mtime_ns}:{st.st_size}".encode()).hexdigest()[:12]
++
++
++def cache_salt_for(name: str, user_salt: str | None = None) -> str:
++    """Prefix-cache salt so KV computed under one variant is never reused by
++    another (or by a re-registered version of the same name)."""
++    tag = f"aeon-v.{name}.{file_salt(variant_path(name))}"
++    return f"{user_salt}.{tag}"[-128:] if user_salt else tag
++
++
++def read_variant(path: str) -> tuple[torch.Tensor, torch.Tensor]:
++    from safetensors.torch import load_file
++
++    t = load_file(path)
++    return canonicalize(t["dirs"], t["scales"])
++
++
++# ---------------------------------------------------------------------------
++# fused per-token rank-K removal (Triton), in place on the o_proj output
++# ---------------------------------------------------------------------------
++_kernel = None
++
++
++def _get_kernel():
++    global _kernel
++    if _kernel is not None:
++        return _kernel
++    import triton
++    import triton.language as tl
++
++    @triton.jit
++    def aeon_variant_oproj_kernel(
++        y_ptr, stride_y, vid_ptr, dirs_ptr, scales_ptr, app, D,
++        NAPP: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexpr,
++    ):
++        row = tl.program_id(0)
++        v = tl.load(vid_ptr + row)
++        if v != 0:
++            offs = tl.arange(0, BLOCK)
++            m = offs < D
++            yp = y_ptr + row.to(tl.int64) * stride_y + offs
++            y = tl.load(yp, mask=m, other=0.0).to(tl.float32)
++            base = (v.to(tl.int64) * NAPP + app) * K
++            for k in tl.static_range(K):
++                s = tl.load(scales_ptr + base + k)
++                r = tl.load(dirs_ptr + (base + k) * D + offs, mask=m, other=0.0)
++                y = y - (s * tl.sum(y * r, axis=0)) * r
++            tl.store(yp, y.to(y_ptr.dtype.element_ty), mask=m)
++
++    _kernel = (aeon_variant_oproj_kernel, triton.next_power_of_2)
++    return _kernel
++
++
++def apply_rows_reference(y: torch.Tensor, vid: torch.Tensor, dirs: torch.Tensor,
++                         scales: torch.Tensor, app: int) -> torch.Tensor:
++    """Torch reference of the kernel (fp32 per row, one bf16 rounding)."""
++    out = y.clone()
++    rows = (vid != 0).nonzero().flatten()
++    if rows.numel() == 0:
++        return out
++    yy = y[rows].float()
++    for k in range(dirs.shape[2]):
++        r = dirs[vid[rows].long(), app, k]
++        s = scales[vid[rows].long(), app, k]
++        yy = yy - (s * (yy * r).sum(-1))[:, None] * r
++    out[rows] = yy.to(y.dtype)
++    return out
++
++
++# ---------------------------------------------------------------------------
++# worker-side bank and per-token variant map
++# ---------------------------------------------------------------------------
++class VariantBank:
++    def __init__(self) -> None:
++        self.root = variant_dir()
++        self.enabled = self.root is not None
++        self.rescan_s = float(os.environ.get("AEON_VARIANT_RESCAN_S", "1.0"))
++        self.slots: dict[str, int] = {}          # name -> slot (>= 1)
++        self.stamp: dict[str, tuple[int, int]] = {}
++        self.app_mask: dict[int, np.ndarray] = {}
++        self.free: list[int] = []
++        self.next_slot = 1
++        self.dirs: torch.Tensor | None = None    # [cap, 48, K, D] fp32
++        self.scales: torch.Tensor | None = None  # [cap, 48, K] fp32
++        self.hidden: int | None = None
++        self.req_names: dict[int, str | None] = {}
++        self.vid: torch.Tensor | None = None     # [rows] int32
++        self.active = False
++        self.rows = 0
++        self.apps_on = np.zeros(NUM_APPS, dtype=bool)
++        self.last_scan = 0.0
++        self.warned: set[str] = set()
++        self.checked_mode = False
++        self.device: torch.device | None = None
++
++    # -- request bookkeeping (model runner) --------------------------------
++    def add_request(self, req_index: int, sampling_params: Any) -> None:
++        name = None
++        extra = getattr(sampling_params, "extra_args", None) or {}
++        try:
++            name = normalize_name(extra.get("aeon_variant"))
++        except ValueError as e:
++            logger.error("AEON variants: %s; serving stock", e)
++        self.req_names[req_index] = name
++
++    # -- registry -----------------------------------------------------------
++    def _alloc(self, cap: int, k: int, d: int) -> None:
++        new_d = torch.zeros(cap, NUM_APPS, k, d, dtype=torch.float32, device=self.device)
++        new_s = torch.zeros(cap, NUM_APPS, k, dtype=torch.float32, device=self.device)
++        if self.dirs is not None:
++            c0, _, k0, _ = self.dirs.shape
++            new_d[:c0, :, :k0] = self.dirs
++            new_s[:c0, :, :k0] = self.scales
++        self.dirs, self.scales = new_d, new_s
++
++    def _load(self, name: str, path: str) -> None:
++        d, s = read_variant(path)
++        k, hid = d.shape[1], d.shape[2]
++        if self.hidden is None:
++            self.hidden = hid
++        if hid != self.hidden:
++            raise ValueError(f"variant {name}: hidden {hid} != {self.hidden}")
++        slot = self.slots.get(name)
++        if slot is None:
++            slot = self.free.pop() if self.free else self.next_slot
++            if slot == self.next_slot:
++                self.next_slot += 1
++        cap = 0 if self.dirs is None else self.dirs.shape[0]
++        kk = 0 if self.dirs is None else self.dirs.shape[2]
++        if slot >= cap or k > kk:
++            self._alloc(max(cap, 1 << max(3, slot.bit_length())), max(k, kk, 1), hid)
++        assert self.dirs is not None and self.scales is not None
++        self.dirs[slot].zero_()
++        self.scales[slot].zero_()
++        self.dirs[slot, :, :k] = d.to(self.device)
++        self.scales[slot, :, :k] = s.to(self.device)
++        self.slots[name] = slot
++        self.app_mask[slot] = (s != 0).any(dim=1).numpy()
++        on = np.nonzero(self.app_mask[slot])[0]
++        logger.info("AEON variants: loaded %s -> slot %d (rank %d, %d apps%s)", name, slot, k,
++                    len(on), f" {on[0]}..{on[-1]}" if len(on) else "")
++
++    def scan(self) -> None:
++        self.last_scan = time.monotonic()
++        seen: dict[str, tuple[int, int]] = {}
++        try:
++            entries = list(os.scandir(self.root))
++        except FileNotFoundError:
++            entries = []
++        for e in entries:
++            if not e.name.endswith(".safetensors"):
++                continue
++            name = e.name[: -len(".safetensors")]
++            if not NAME_RE.match(name) or name == "stock":
++                continue
++            st = e.stat()
++            seen[name] = (st.st_mtime_ns, st.st_size)
++        for name, stamp in seen.items():
++            if self.stamp.get(name) != stamp:
++                try:
++                    self._load(name, os.path.join(self.root, f"{name}.safetensors"))
++                    self.stamp[name] = stamp
++                    self.warned.discard(name)
++                except Exception as e:  # keep serving on a bad file
++                    logger.error("AEON variants: cannot load %s: %s", name, e)
++        for name in [n for n in self.slots if n not in seen]:
++            slot = self.slots.pop(name)
++            self.stamp.pop(name, None)
++            self.app_mask.pop(slot, None)
++            self.free.append(slot)
++            logger.info("AEON variants: removed %s (slot %d)", name, slot)
++
++    # -- per step -----------------------------------------------------------
++    def prepare(self, input_batch: Any, cudagraph_mode: Any = None) -> None:
++        self.active = False
++        if not self.checked_mode:
++            self.checked_mode = True
++            mode = getattr(cudagraph_mode, "name", str(cudagraph_mode))
++            if cudagraph_mode is not None and mode != "NONE":
++                raise RuntimeError(
++                    "AEON_VARIANT_DIR needs eager execution (enforce_eager=True / "
++                    f"--enforce-eager); cudagraph_mode is {mode}")
++        n_req = input_batch.num_reqs
++        names = [self.req_names.get(int(i)) for i in input_batch.idx_mapping_np[:n_req]]
++        if not any(names):
++            return
++        if self.device is None:
++            self.device = input_batch.positions.device
++        unknown = any(n not in self.slots for n in names if n)
++        if unknown or time.monotonic() - self.last_scan > self.rescan_s:
++            self.scan()
++        slots = np.zeros(n_req, dtype=np.int32)
++        for j, n in enumerate(names):
++            if n:
++                s = self.slots.get(n)
++                if s is None:
++                    if n not in self.warned:
++                        self.warned.add(n)
++                        logger.error("AEON variants: unknown variant %r; serving stock", n)
++                    continue
++                slots[j] = s
++        if not slots.any():
++            return
++        qsl = input_batch.query_start_loc_np
++        counts = np.diff(qsl[: n_req + 1])
++        rows = int(input_batch.num_tokens_after_padding)
++        vid = np.zeros(rows, dtype=np.int32)
++        vid[: int(qsl[n_req])] = np.repeat(slots, counts)
++        apps = np.zeros(NUM_APPS, dtype=bool)
++        for s in np.unique(slots):
++            if s:
++                apps |= self.app_mask[int(s)]
++        if not apps.any():
++            return
++        if self.vid is None or self.vid.numel() < rows:
++            self.vid = torch.zeros(max(rows, 8192), dtype=torch.int32, device=self.device)
++        self.vid[:rows].copy_(torch.from_numpy(vid).pin_memory(), non_blocking=True)
++        self.rows, self.apps_on, self.active = rows, apps, True
++
++    def apply(self, y: torch.Tensor, app: int) -> torch.Tensor:
++        if not self.active or app < 0 or app >= NUM_APPS or not self.apps_on[app]:
++            return y
++        if y.shape[0] != self.rows or y.shape[-1] != self.hidden or not y.is_contiguous():
++            logger.error("AEON variants: o_proj output %s does not match the step map "
++                         "(%d rows, hidden %s); edit skipped", tuple(y.shape), self.rows, self.hidden)
++            return y
++        kern, np2 = _get_kernel()
++        assert self.dirs is not None
++        kern[(self.rows,)](
++            y, y.stride(0), self.vid, self.dirs, self.scales, app, self.hidden,
++            NAPP=NUM_APPS, K=self.dirs.shape[2], BLOCK=np2(self.hidden), num_warps=4,
++        )
++        return y
++
++    def end_step(self) -> None:
++        self.active = False
++
++
++VARIANTS = VariantBank()
++
++
++# ---------------------------------------------------------------------------
++# API-server side helpers (no GPU)
++# ---------------------------------------------------------------------------
++def request_hook(data: Any) -> Any:
++    """Pydantic before-validator for OpenAI chat/completion requests: accept a
++    top-level "aeon_variant" (or vllm_xargs.aeon_variant), check it exists,
++    pass it to the engine in vllm_xargs and salt the prefix cache by variant."""
++    if not isinstance(data, dict):
++        return data
++    top = data.pop("aeon_variant", None)
++    xargs = data.get("vllm_xargs") or {}
++    raw = top if top is not None else xargs.get("aeon_variant")
++    if raw is None:
++        return data
++    name = normalize_name(raw)
++    xargs = {k: v for k, v in xargs.items() if k != "aeon_variant"}
++    if name is not None:
++        if not variant_dir():
++            raise ValueError("aeon_variant needs AEON_VARIANT_DIR on the server")
++        if not os.path.exists(variant_path(name)):
++            raise ValueError(f"unknown aeon_variant {name!r}; register it at /aeon/variants")
++        xargs["aeon_variant"] = name
++        data["cache_salt"] = cache_salt_for(name, data.get("cache_salt"))
++    data["vllm_xargs"] = xargs or None
++    return data
++
++
++def list_variants(root: str | None = None) -> list[dict]:
++    root = root or variant_dir()
++    out = []
++    if not root or not os.path.isdir(root):
++        return out
++    for fn in sorted(os.listdir(root)):
++        name = fn[: -len(".safetensors")] if fn.endswith(".safetensors") else None
++        if not name or not NAME_RE.match(name) or name == "stock":
++            continue
++        path = os.path.join(root, fn)
++        try:
++            d, s = read_variant(path)
++            out.append(summarize(name, d, s, path))
++        except Exception as e:
++            out.append({"name": name, "error": str(e)})
++    return out
++
++
++def delete_variant(name: str, root: str | None = None) -> bool:
++    name = normalize_name(name)
++    if name is None:
++        raise ValueError("'stock' cannot be deleted")
++    path = variant_path(name, root)
++    if not os.path.exists(path):
++        return False
++    os.remove(path)
++    return True
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 46c364388..892b16bf7 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -18,6 +18,7 @@ instead of embedding feature-specific logic directly.
+ 
+ import functools
+ import gc
++import os
+ import time
+ from collections.abc import Iterable, Iterator
+ from contextlib import AbstractContextManager, contextmanager
+@@ -206,6 +207,12 @@ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
+ logger = init_logger(__name__)
+ 
+ 
++# AEON per-request ablation variants (off unless AEON_VARIANT_DIR is set).
++_AEON_VARIANTS = None
++if os.environ.get("AEON_VARIANT_DIR"):
++    from vllm.models.inkling2.amd.aeon_variants import VARIANTS as _AEON_VARIANTS
++
++
+ class GPUModelRunner(LoRAModelRunnerMixin):
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         self.vllm_config = vllm_config
+@@ -1358,6 +1365,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 req_index, new_req_data.block_ids, overwrite=True
+             )
+             self.lora_state.add_request(req_id, req_index, new_req_data.lora_request)
++            if _AEON_VARIANTS is not None:
++                _AEON_VARIANTS.add_request(req_index, new_req_data.sampling_params)
+ 
+             if self.is_last_pp_rank and new_req_data.sampling_params is not None:
+                 assert self.sampler is not None
+@@ -1964,6 +1973,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 scheduler_output, batch_req_state, batch_desc, num_active_loras
+             )
+             block_tables, slot_mappings = self.prepare_attn(input_batch)
++            if _AEON_VARIANTS is not None:
++                _AEON_VARIANTS.prepare(
++                    input_batch, self.compilation_config.cudagraph_mode
++                )
+             # Mamba prefix-cache pre-copy: migrate recurrent state across block
+             # boundaries before the forward. Runs only on real batches, and
+             # before model_state.prepare_attn gathers num_accepted_tokens so the
+-- 
+2.53.0
+
