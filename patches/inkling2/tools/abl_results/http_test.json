@@ -1,0 +1,28 @@
+{
+ "register_path": [
+  200,
+  1,
+  44
+ ],
+ "register_json": [
+  200,
+  1,
+  44
+ ],
+ "list": [
+  "h_eq",
+  "h_pass"
+ ],
+ "xargs_eq_top_level": true,
+ "stock_named_eq_stock": true,
+ "variant_differs_from_stock": true,
+ "burst_text_match": 0,
+ "burst_n": 12,
+ "burst_max_lp_diff": 1.7953715808689594,
+ "unknown_variant": 400,
+ "bad_name": 400,
+ "bad_shape": 400,
+ "delete": 200,
+ "after_delete_request": 400,
+ "delete_missing": 404
+}

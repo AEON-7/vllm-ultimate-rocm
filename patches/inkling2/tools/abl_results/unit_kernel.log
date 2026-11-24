@@ -1,0 +1,11 @@
+active True slots {'c': 1, 'b': 2, 'a': 3} apps_on 48
+max |kernel-ref| 0.001953125
+row5 vs formula 0.007542610168457031
+layer map ok True True
+app_to_layer [0, 5, 6, 17, 6, 17, 6, 17, 18, 23]
+mixed launch bitwise == single-variant launches: OK
+after end_step active False -> apply is a no-op: True
+hook {'aeon_variant': 'a'} user1.aeon-v.a.71d804c4b5d1
+hook stock {'vllm_xargs': None}
+rejected: unknown aeon_variant 'nope'; register it at /aeon/variants
+rejected: invalid aeon_variant name '../x'
