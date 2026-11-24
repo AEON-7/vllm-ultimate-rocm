@@ -1,0 +1,59 @@
+{
+ "analytic": {
+  "max_ulps": 0.582305908203125,
+  "frac_bitwise_equal": 0.9999769315944882,
+  "tensors": 55
+ },
+ "refuse_app5": "bad.safetensors: residual edits at apps [5] are not bakeable (apps 5-40 feed the shared loop layers / pass restarts; only 0-4 and 41-47 fold)",
+ "refuse_app20_40": "bad.safetensors: residual edits at apps [20, 40] are not bakeable (apps 5-40 feed the shared loop layers / pass restarts; only 0-4 and 41-47 fold)",
+ "refuse_perpass_scale": "bad.safetensors: o_proj edit on shared loop layer 6 differs between apps [6, 18, 30] (per-pass scales/dirs cannot be baked into weights the passes share)",
+ "refuse_perpass_dirs": "bad.safetensors: o_proj edit on shared loop layer 6 differs between apps [6, 18, 30] (per-pass scales/dirs cannot be baked into weights the passes share)",
+ "refuse_quantized_consumer": "model.llm.unembed.weight: torch.uint8 (500, 64) is quantized/packed; baking would need a requant (not supported)",
+ "writers": "overlay == baked; full checkpoint: header identical, edited tensors patched, others bitwise; stock unchanged",
+ "aeon_weight_overlay": {
+  "replaced": 55,
+  "includes": [
+   "attn_sink_proj",
+   "gate_attn",
+   "k_sconv",
+   "model.llm.unembed.weight",
+   "v_sconv",
+   "wk_dv",
+   "wo_ud",
+   "wq_du",
+   "wr_du",
+   "wv_dv"
+  ]
+ },
+ "real_stock": {
+  "r_cons": {
+   "tensors": 54,
+   "worst_leak": 0.007886274574895859,
+   "mean_leak": 0.004759282786449083,
+   "max_rounding_rel_err": 0.0016632345628198562,
+   "dtypes": [
+    "torch.bfloat16"
+   ]
+  },
+  "r_47": {
+   "tensors": 1,
+   "worst_leak": 0.002913884727666876,
+   "mean_leak": 0.002913884727666876,
+   "max_rounding_rel_err": 0.0016157423895801534,
+   "dtypes": [
+    "torch.bfloat16"
+   ]
+  },
+  "op_only": {
+   "tensors": 20,
+   "worst_leak": 0.0067371939998159824,
+   "mean_leak": 0.0056213466181188835,
+   "max_rounding_rel_err": 0.0015859673541941289,
+   "dtypes": [
+    "torch.bfloat16"
+   ]
+  },
+  "r_res": "r_res.safetensors: residual edits at apps [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40] are not bakeable ("
+ }
+}
+R5 BAKE TEST: ALL PASS
