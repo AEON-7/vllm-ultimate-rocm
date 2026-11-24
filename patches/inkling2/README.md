@@ -17,6 +17,7 @@ git am /path/to/patches/inkling2/*.patch
 | 0004 | Per-pass KV caches and conv states for looped layers | port of the upstream NVIDIA design (`nvidia/attention.py`, `nvidia/loop.py`, #69028) to the AMD package | Apache-2.0 |
 | 0005 | Inkling-2-Mini (`inkling2_loop`) on RDNA4 and CDNA | loop model ported from upstream `nvidia/loop.py` (#69028); gfx12 wiring, arch gate, offloader hook are AEON | Apache-2.0 |
 | 0006 | AEON research hooks: weight overlay, activation capture, runtime o_proj ablation | original AEON work | Apache-2.0 |
+| 0007 | AEON per-request multi-variant o_proj ablation (variant bank, per-token map, fused Triton kernel, `/aeon/variants` API, `aeon_variant` request field) | original AEON work | Apache-2.0 |
 
 Clean room: no code, binaries or images from vllm-redshift were read or used.
 Sources were upstream vLLM (Apache-2.0), the model's HF config and
@@ -48,6 +49,14 @@ Never set `PYTORCH_HIP_ALLOC_CONF=expandable_segments`.
 - Full logprobs: `max_logprobs=1000`, `SamplingParams(prompt_logprobs=1000)`
   gives teacher-forced top-1000 scoring (see `tools/kl_eval.py`).
 
+## Per-request ablation variants (patch 0007), off by default
+
+`AEON_VARIANT_DIR=/dir` turns it on (eager mode only): one server applies a
+different registered o_proj edit per request, so an abliteration screen runs
+many variants concurrently with no restart. Register with
+`POST /aeon/variants`, select with `"aeon_variant": "<name>"` in the request
+body. See `docs/inkling2-rocm/ABLATION_SERVING.md`.
+
 ## Tools
 
 - `tools/kl_eval.py`: KL(stock transformers ref || vLLM) and top-1 on the
@@ -59,3 +68,9 @@ Never set `PYTORCH_HIP_ALLOC_CONF=expandable_segments`.
   per-layer, per-pass activation diff vs transformers.
 - `tools/hooks_test.py`: functional test of the AEON hooks.
 - `tools/prof_decode.py`: rough per-module decode time split.
+- `tools/abl_validate.py`, `tools/abl_inproc.py`, `tools/abl_inproc2.py`,
+  `tools/abl_compare.py`, `tools/abl_compare_lib.py`, `tools/run_abl.sh`:
+  patch 0007 validation (stock exactness, request vs AEON_ABLATE vs baked
+  overlay, mixed batches, throughput); `tools/abl_unit_kernel.py` kernel and
+  API-hook unit test; `tools/abl_http_test.py` HTTP end to end. Results in
+  `tools/abl_results/`.
