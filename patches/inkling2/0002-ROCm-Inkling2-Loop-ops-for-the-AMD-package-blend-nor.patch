@@ -1,0 +1,328 @@
+From 5a9bb114cdea39cfe496a8c2e14fe7f746415f75 Mon Sep 17 00:00:00 2001
+From: AEON-7 <aeon-7@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 18:59:05 -0600
+Subject: [PATCH 2/6] [ROCm][Inkling2] Loop ops for the AMD package: blend
+ norms and fp32 AttnRes mixes
+
+- amd/ops/loop.py: pair_rms_norm / blend_rms_norm Triton kernels ported
+  from upstream vllm/models/inkling2/nvidia/ops/loop.py (PR #69028,
+  Apache-2.0). The PTX rsqrt inline asm is replaced by tl.rsqrt so the
+  kernels build for gfx12/gfx9.
+- amd/ops/attn_res.py: APPLY_NORM constexpr. norm_weight=None returns the
+  fp32 mixes without the RMSNorm (the loop message path needs this), and
+  zero-token calls return early. Original AEON change.
+
+Signed-off-by: AEON-7 <aeon-7@users.noreply.github.com>
+---
+ vllm/models/inkling2/amd/ops/attn_res.py |  85 ++++++++------
+ vllm/models/inkling2/amd/ops/loop.py     | 138 +++++++++++++++++++++++
+ 2 files changed, 190 insertions(+), 33 deletions(-)
+ create mode 100644 vllm/models/inkling2/amd/ops/loop.py
+
+diff --git a/vllm/models/inkling2/amd/ops/attn_res.py b/vllm/models/inkling2/amd/ops/attn_res.py
+index a8d139dbc..b685fb062 100644
+--- a/vllm/models/inkling2/amd/ops/attn_res.py
++++ b/vllm/models/inkling2/amd/ops/attn_res.py
+@@ -1,5 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# Modified by AEON-7 (2026): from vLLM PR #67685 (head 800f72e235ac, Apache-2.0);
++# adds the fp32 mode without the sublayer RMSNorm (`norm_weight=None`) that
++# the looped (inkling2_loop) model needs for loop messages and blend inputs.
+ """Block attention residual: softmax-weighted mix of residual stream blocks.
+ 
+ For each token, sources `x_n` (stored blocks, then the partial block plus an
+@@ -70,6 +73,7 @@ def _attn_res_kernel(
+     NORMALIZE: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+     BLOCK_D: tl.constexpr,
++    APPLY_NORM: tl.constexpr = True,
+ ):
+     # One program per (token, query).
+     t = tl.program_id(1).to(tl.int64)
+@@ -112,28 +116,30 @@ def _attn_res_kernel(
+         probs = probs * inv_rms
+ 
+     # Pass 2: RMS of the probability-weighted sum; pass 3: normalized sum.
+-    sum_sq = 0.0
+-    for d0 in tl.range(0, D, BLOCK_D):
+-        offs = d0 + d_idx
+-        acc = (
+-            _mix(
+-                Stack,
+-                stride_s,
+-                Last,
+-                Addend,
+-                row_off,
+-                offs,
+-                offs < D,
+-                probs,
+-                n_idx,
+-                N_STACK,
+-                HAS_ADDEND,
+-                BLOCK_D,
++    out_rstd = 1.0
++    if APPLY_NORM:
++        sum_sq = 0.0
++        for d0 in tl.range(0, D, BLOCK_D):
++            offs = d0 + d_idx
++            acc = (
++                _mix(
++                    Stack,
++                    stride_s,
++                    Last,
++                    Addend,
++                    row_off,
++                    offs,
++                    offs < D,
++                    probs,
++                    n_idx,
++                    N_STACK,
++                    HAS_ADDEND,
++                    BLOCK_D,
++                )
++                * inv_sum
+             )
+-            * inv_sum
+-        )
+-        sum_sq += tl.sum(acc * acc)
+-    out_rstd = tl.rsqrt(tl.div_rn(sum_sq, D) + norm_eps)
++            sum_sq += tl.sum(acc * acc)
++        out_rstd = tl.rsqrt(tl.div_rn(sum_sq, D) + norm_eps)
+     out = Out + tl.program_id(0).to(tl.int64) * T * D + row_off
+     for d0 in tl.range(0, D, BLOCK_D):
+         offs = d0 + d_idx
+@@ -155,8 +161,9 @@ def _attn_res_kernel(
+             )
+             * inv_sum
+         )
+-        w = tl.load(NormW + q_off + offs, mask, other=0).to(tl.float32)
+-        acc = acc * out_rstd * w
++        if APPLY_NORM:
++            w = tl.load(NormW + q_off + offs, mask, other=0).to(tl.float32)
++            acc = acc * out_rstd * w
+         tl.store(out + offs, acc.to(Out.dtype.element_ty), mask)
+ 
+ 
+@@ -179,6 +186,7 @@ def _attn_res_row_kernel(
+     BLOCK_N: tl.constexpr,
+     BLOCK_A: tl.constexpr,
+     BLOCK_B: tl.constexpr,
++    APPLY_NORM: tl.constexpr = True,
+ ):
+     # Small batches: one program per (token, query) holds the row in registers
+     # as a power-of-2 head [0, BLOCK_A) and a masked tail [BLOCK_A, D), so the
+@@ -220,13 +228,16 @@ def _attn_res_row_kernel(
+         acc_b = tl.fma(p, xb, acc_b)
+     acc_a = acc_a * inv_sum
+     acc_b = acc_b * inv_sum
+-    sum_sq = tl.sum(acc_a * acc_a) + tl.sum(acc_b * acc_b)
+-    out_rstd = tl.rsqrt(tl.div_rn(sum_sq, D) + norm_eps)
+     out = Out + tl.program_id(0).to(tl.int64) * T * D + row_off
+-    wa = tl.load(NormW + q_off + da, mask_a, other=0).to(tl.float32)
+-    wb = tl.load(NormW + q_off + db, mask_b, other=0).to(tl.float32)
+-    tl.store(out + da, (acc_a * out_rstd * wa).to(Out.dtype.element_ty), mask_a)
+-    tl.store(out + db, (acc_b * out_rstd * wb).to(Out.dtype.element_ty), mask_b)
++    if APPLY_NORM:
++        sum_sq = tl.sum(acc_a * acc_a) + tl.sum(acc_b * acc_b)
++        out_rstd = tl.rsqrt(tl.div_rn(sum_sq, D) + norm_eps)
++        wa = tl.load(NormW + q_off + da, mask_a, other=0).to(tl.float32)
++        wb = tl.load(NormW + q_off + db, mask_b, other=0).to(tl.float32)
++        acc_a = acc_a * out_rstd * wa
++        acc_b = acc_b * out_rstd * wb
++    tl.store(out + da, acc_a.to(Out.dtype.element_ty), mask_a)
++    tl.store(out + db, acc_b.to(Out.dtype.element_ty), mask_b)
+ 
+ 
+ def attn_res(
+@@ -234,7 +245,7 @@ def attn_res(
+     last: torch.Tensor,
+     addend: torch.Tensor | None,
+     queries: torch.Tensor,
+-    norm_weight: torch.Tensor,
++    norm_weight: torch.Tensor | None,
+     norm_eps: float,
+     normalize_values: bool,
+     eps: float = 1e-6,
+@@ -243,7 +254,7 @@ def attn_res(
+ 
+     `queries` are fp32 `(Q, D)`, already scaled by `D**-0.5`; each fp32
+     mix is RMS-normalized with its row of `norm_weight` `(Q, D)`. Returns
+-    `(Q, T, D)` in `last.dtype`.
++    `(Q, T, D)` in `last.dtype`; with `norm_weight=None`, the fp32 mixes.
+     """
+     num_tokens, d = last.shape
+     num_stack = stack.shape[0]
+@@ -253,8 +264,15 @@ def attn_res(
+     assert stack.stride(1) == d and stack.stride(2) == 1
+     if addend is not None:
+         assert addend.is_contiguous() and addend.shape == last.shape
+-    assert norm_weight.shape == queries.shape and norm_weight.is_contiguous()
+-    out = torch.empty((num_q, num_tokens, d), dtype=last.dtype, device=last.device)
++    apply_norm = norm_weight is not None
++    if apply_norm:
++        assert norm_weight.shape == queries.shape and norm_weight.is_contiguous()
++    else:
++        norm_weight = queries  # unused placeholder pointer
++    out_dtype = last.dtype if apply_norm else torch.float32
++    out = torch.empty((num_q, num_tokens, d), dtype=out_dtype, device=last.device)
++    if num_tokens == 0:
++        return out
+     args = (
+         stack,
+         last,
+@@ -273,6 +291,7 @@ def attn_res(
+         HAS_ADDEND=addend is not None,
+         NORMALIZE=normalize_values,
+         BLOCK_N=triton.next_power_of_2(num_stack + 1),
++        APPLY_NORM=apply_norm,
+         enable_fp_fusion=False,
+     )
+     # The queries of a token run back to back and share its sources in L2.
+diff --git a/vllm/models/inkling2/amd/ops/loop.py b/vllm/models/inkling2/amd/ops/loop.py
+new file mode 100644
+index 000000000..5a2352fa1
+--- /dev/null
++++ b/vllm/models/inkling2/amd/ops/loop.py
+@@ -0,0 +1,138 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# Modified by AEON-7 (2026): copied from vllm/models/inkling2/nvidia/ops/loop.py
++# (vLLM PR #69028, Apache-2.0) for the ROCm backend; the PTX rsqrt.approx
++# helper is replaced by tl.rsqrt, everything else is unchanged.
++"""Loop message controllers, batched over streams.
++
++A controller blends a fp32 message into a fp32 sublayer input `dest`: from
++`h = down(rms([dest, message]))` (bf16), `out = (1 - tanh(forget(h))) * dest +
++tanh(gain(h)) * message` in fp32, unfused as the reference. The output feeds
++the sublayer's RMSNorm, applied in the same kernel.
++"""
++
++import torch
++
++from vllm.triton_utils import tl, tldevice, triton
++
++
++@triton.jit
++def rsqrt(x):
++    return tl.rsqrt(x)
++
++
++@triton.jit
++def _pair_rms_norm_kernel(
++    Dest,
++    Message,
++    Out,
++    stride_dest_s,
++    T,
++    eps,
++    D: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    s = tl.program_id(0).to(tl.int64)
++    t = tl.program_id(1).to(tl.int64)
++    cols = tl.arange(0, BLOCK)
++    mask = cols < D
++    dest = tl.load(Dest + s * stride_dest_s + t * D + cols, mask, other=0)
++    message = tl.load(Message + (s * T + t) * D + cols, mask, other=0)
++    dest_rstd = rsqrt(tl.div_rn(tl.sum(dest * dest), D) + eps)
++    message_rstd = rsqrt(tl.div_rn(tl.sum(message * message), D) + eps)
++    out = Out + (s * T + t) * (2 * D)
++    tl.store(out + cols, (dest * dest_rstd).to(Out.dtype.element_ty), mask)
++    tl.store(out + D + cols, (message * message_rstd).to(Out.dtype.element_ty), mask)
++
++
++def pair_rms_norm(dest: torch.Tensor, message: torch.Tensor) -> torch.Tensor:
++    """bf16 `(S, T, 2D)` `[rms(dest), rms(message)]` of fp32 `(S, T, D)`
++    inputs, weightless; `dest` may broadcast over streams (stride 0)."""
++    num_streams, num_tokens, d = message.shape
++    assert dest.shape == message.shape and message.is_contiguous()
++    assert dest.stride(1) == d and dest.stride(2) == 1
++    assert dest.dtype == message.dtype == torch.float32
++    out = message.new_empty((num_streams, num_tokens, 2 * d), dtype=torch.bfloat16)
++    if num_tokens:
++        _pair_rms_norm_kernel[(num_streams, num_tokens)](
++            dest,
++            message,
++            out,
++            dest.stride(0),
++            num_tokens,
++            1e-6,
++            D=d,
++            BLOCK=triton.next_power_of_2(d),
++            num_warps=8,
++        )
++    return out
++
++
++@triton.jit
++def _blend_rms_norm_kernel(
++    Dest,
++    Message,
++    GainForget,
++    NormW,
++    Out,
++    stride_dest_s,
++    stride_w_s,
++    T,
++    norm_eps,
++    D: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    s = tl.program_id(0).to(tl.int64)
++    t = tl.program_id(1).to(tl.int64)
++    cols = tl.arange(0, BLOCK)
++    mask = cols < D
++    row = s * T + t
++    dest = tl.load(Dest + s * stride_dest_s + t * D + cols, mask, other=0)
++    message = tl.load(Message + row * D + cols, mask, other=0)
++    gain = tldevice.tanh(tl.load(GainForget + row * (2 * D) + cols, mask, other=0))
++    forget = tldevice.tanh(
++        tl.load(GainForget + row * (2 * D) + D + cols, mask, other=0)
++    )
++    x = (1.0 - forget) * dest + gain * message
++    rstd = rsqrt(tl.div_rn(tl.sum(x * x), D) + norm_eps)
++    y = x * rstd
++    y = y * tl.load(NormW + s * stride_w_s + cols, mask, other=0).to(tl.float32)
++    tl.store(Out + row * D + cols, y.to(Out.dtype.element_ty), mask)
++
++
++def blend_rms_norm(
++    dest: torch.Tensor,
++    message: torch.Tensor,
++    gain_forget: torch.Tensor,
++    norm_weight: torch.Tensor,
++    norm_eps: float,
++) -> torch.Tensor:
++    """bf16 `(S, T, D)` RMSNorm (row `s` of `norm_weight` `(S, D)`) of
++    `(1 - tanh(forget)) * dest + tanh(gain) * message`, with fp32 `(S, T, D)`
++    `dest` (may broadcast over streams) and `message`, and fp32 `(S, T, 2D)`
++    `gain_forget` = `[gain, forget]`. `norm_weight` may broadcast too."""
++    num_streams, num_tokens, d = message.shape
++    assert dest.shape == message.shape and message.is_contiguous()
++    assert dest.stride(1) == d and dest.stride(2) == 1
++    assert gain_forget.shape == (num_streams, num_tokens, 2 * d)
++    assert gain_forget.is_contiguous() and gain_forget.dtype == torch.float32
++    assert norm_weight.shape == (num_streams, d) and norm_weight.stride(1) == 1
++    out = message.new_empty((num_streams, num_tokens, d), dtype=torch.bfloat16)
++    if num_tokens:
++        _blend_rms_norm_kernel[(num_streams, num_tokens)](
++            dest,
++            message,
++            gain_forget,
++            norm_weight,
++            out,
++            dest.stride(0),
++            norm_weight.stride(0),
++            num_tokens,
++            norm_eps,
++            D=d,
++            BLOCK=triton.next_power_of_2(d),
++            num_warps=8,
++            # The blend is unfused (no FMA), as the reference.
++            enable_fp_fusion=False,
++        )
++    return out
+-- 
+2.53.0
+

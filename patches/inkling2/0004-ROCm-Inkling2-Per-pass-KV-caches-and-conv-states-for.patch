@@ -1,0 +1,285 @@
+From 1024520931110d9c31306732264cd3bf727cf895 Mon Sep 17 00:00:00 2001
+From: AEON-7 <aeon-7@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 18:59:05 -0600
+Subject: [PATCH 4/6] [ROCm][Inkling2] Per-pass KV caches and conv states for
+ looped layers
+
+Looped layers (6..17, 3 passes) keep one attention KV cache and one
+short-conv state per pass, following the upstream NVIDIA design in
+vllm/models/inkling2/nvidia/{attention,loop}.py (PR #69028, Apache-2.0):
+Inkling2AttentionPassCache registers .pass{p} attention layers, the conv
+states get .conv_state.pass{p}, forward() takes pass_idx, and the short
+conv accepts an owner override. The fused QKV projection is used only
+when all three inputs alias. Ported to the AMD package by AEON-7.
+
+Signed-off-by: AEON-7 <aeon-7@users.noreply.github.com>
+---
+ vllm/models/inkling2/amd/attention.py | 121 +++++++++++++++++++++-----
+ vllm/models/inkling2/amd/sconv.py     |  15 +++-
+ 2 files changed, 111 insertions(+), 25 deletions(-)
+
+diff --git a/vllm/models/inkling2/amd/attention.py b/vllm/models/inkling2/amd/attention.py
+index 05782538d..c9e39bdab 100644
+--- a/vllm/models/inkling2/amd/attention.py
++++ b/vllm/models/inkling2/amd/attention.py
+@@ -1,5 +1,9 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# Modified by AEON-7 (2026): from vLLM PR #67685 (head 800f72e235ac, Apache-2.0);
++# adds per-loop-pass KV/conv caches (`Inkling2AttentionPassCache`, after the
++# NVIDIA backend of PR #69028) and separate k/v inputs for local layers in
++# loop passes, for inkling2_loop (Inkling-2-Mini) on gfx12.
+ """Inkling2 attention: relative-bias GQA with short-conv K/V, L2-clipped
+ q/k/r, gated output and per-token attention sinks."""
+ 
+@@ -59,6 +63,56 @@ class Inkling2AttentionBackend(FlashAttentionBackend):
+         return Inkling2AttentionMetadataBuilder
+ 
+ 
++def _kv_cache_layer_config(
++    vllm_config: VllmConfig,
++    num_kv_heads: int,
++    head_dim: int,
++    sliding_window: int | None,
++) -> KVCacheLayerConfig:
++    spec = AttentionSpec(
++        block_size=vllm_config.cache_config.block_size,
++        num_kv_heads=num_kv_heads,
++        head_size=head_dim,
++        dtype=vllm_config.model_config.dtype,
++    )
++    if sliding_window is not None:
++        return SlidingWindowManager.layer_config(spec, sliding_window=sliding_window)
++    return FullAttentionManager.layer_config(spec)
++
++
++class Inkling2AttentionPassCache(nn.Module, AttentionLayerBase):
++    """The KV cache of one extra loop pass of a looped `Inkling2Attention`
++    (each pass of the loop core attends over its own keys and values)."""
++
++    def __init__(
++        self,
++        prefix: str,
++        num_heads: int,
++        num_kv_heads: int,
++        head_dim: int,
++        sliding_window: int | None,
++    ) -> None:
++        super().__init__()
++        self.prefix = prefix
++        self.num_heads = num_heads
++        self.num_kv_heads = num_kv_heads
++        self.head_dim = head_dim
++        self.sliding_window = sliding_window
++        self.kv_cache = torch.tensor([])
++        forward_context = get_current_vllm_config().compilation_config
++        if prefix in forward_context.static_forward_context:
++            raise ValueError(f"Duplicate layer name: {prefix}")
++        forward_context.static_forward_context[prefix] = self
++
++    def get_attn_backend(self) -> type[AttentionBackend]:
++        return Inkling2AttentionBackend
++
++    def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig:
++        return _kv_cache_layer_config(
++            vllm_config, self.num_kv_heads, self.head_dim, self.sliding_window
++        )
++
++
+ class Inkling2Attention(nn.Module, AttentionLayerBase):
+     """Inkling2 attention for one decoder layer.
+ 
+@@ -73,6 +127,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+         is_local: bool,
+         conv_state: InklingConvState,
+         prefix: str,
++        pass_conv_states: tuple[InklingConvState, ...] = (),
+     ) -> None:
+         super().__init__()
+         self.prefix = prefix
+@@ -151,6 +206,17 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+             )
+ 
+         self.conv_state = conv_state
++        self.conv_states = (conv_state, *pass_conv_states)
++        self.pass_caches = nn.ModuleList(
++            Inkling2AttentionPassCache(
++                f"{prefix}.pass{p}",
++                self.num_heads,
++                self.num_kv_heads,
++                self.head_dim,
++                self.sliding_window if is_local else None,
++            )
++            for p in range(1, len(self.conv_states))
++        )
+         self.k_sconv, self.v_sconv = (
+             Inkling2ShortConv(
+                 kv_size,
+@@ -180,23 +246,25 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+         return Inkling2AttentionBackend
+ 
+     def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig:
+-        spec = AttentionSpec(
+-            block_size=vllm_config.cache_config.block_size,
+-            num_kv_heads=self.num_kv_heads,
+-            head_size=self.head_dim,
+-            dtype=vllm_config.model_config.dtype,
++        return _kv_cache_layer_config(
++            vllm_config,
++            self.num_kv_heads,
++            self.head_dim,
++            self.sliding_window if self.is_local else None,
+         )
+-        if self.is_local:
+-            return SlidingWindowManager.layer_config(
+-                spec, sliding_window=self.sliding_window
+-            )
+-        return FullAttentionManager.layer_config(spec)
++
++    def _pass_cache(self, pass_idx: int) -> tuple[str, torch.Tensor]:
++        """The attention metadata key and KV cache of loop pass `pass_idx`."""
++        if pass_idx == 0 or not self.pass_caches:
++            return self.prefix, self.kv_cache
++        cache = self.pass_caches[pass_idx - 1]
++        return cache.prefix, cache.kv_cache
+ 
+     def _project(
+         self, x_q: torch.Tensor, x_k: torch.Tensor, x_v: torch.Tensor
+     ) -> list[torch.Tensor]:
+         weight = self.qkvr.weight
+-        if self.is_local:
++        if x_k is x_q and x_v is x_q:
+             projected = nn.functional.linear(x_q, weight)
+             return list(projected.split(self.split_sizes, dim=-1)[:6])
+         q_side, kv_size = sum(self.split_sizes[:4]), self.split_sizes[4]
+@@ -206,8 +274,10 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+         v = nn.functional.linear(x_v, weight[k_end : k_end + kv_size])
+         return [*projected.split(self.q_side_splits, dim=-1)[:4], k, v]
+ 
+-    def _split_kv_cache(self) -> tuple[torch.Tensor, torch.Tensor]:
+-        key_cache, value_cache = self.kv_cache.transpose(1, 2).split(
++    def _split_kv_cache(
++        self, kv_cache: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        key_cache, value_cache = kv_cache.transpose(1, 2).split(
+             self.head_dim, dim=-1
+         )
+         return (
+@@ -222,15 +292,20 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+         x_k: torch.Tensor | None = None,
+         x_v: torch.Tensor | None = None,
+         tau: torch.Tensor | None = None,
++        pass_idx: int = 0,
+     ) -> torch.Tensor:
+         """Return this rank's bf16 `(T, hidden)` partial output (to be
+         all-reduced over TP).
+ 
+-        Local layers read q/k/v from `x_q`; full layers take `x_k`, `x_v` and
+-        the fp32 log-scaling `tau` for q/r.
++        Local layers read q/k/v from `x_q` (or `x_k` / `x_v` if given, in
++        loop passes after the first); full layers take `x_k`, `x_v` and the
++        fp32 log-scaling `tau` for q/r. `pass_idx` picks the loop pass's
++        caches.
+         """
+         if self.is_local:
+-            x_k = x_v = x_q
++            tau = None
++            if x_k is None:
++                x_k = x_v = x_q
+         assert x_k is not None and x_v is not None
+         q, r, gate, sinks, k, v = self._project(x_q, x_k, x_v)
+         output = torch.empty(gate.shape, dtype=q.dtype, device=q.device)
+@@ -246,6 +321,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+             self.v_sconv.dynamic_taps(x_v),
+             tau,
+             output,
++            pass_idx,
+         )
+         return nn.functional.linear(output, self.wo_ud.weight)
+ 
+@@ -263,6 +339,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+         v_dynamic: torch.Tensor | None,
+         tau: torch.Tensor | None,
+         output: torch.Tensor,
++        pass_idx: int = 0,
+     ) -> None:
+         """Write the gated attention output to `output`.
+ 
+@@ -272,15 +349,17 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+         token count.
+         """
+         attn_metadata = get_forward_context().attn_metadata
+-        if not isinstance(attn_metadata, dict) or self.kv_cache.numel() == 0:
++        layer_name, kv_cache = self._pass_cache(pass_idx)
++        conv_state = self.conv_states[pass_idx]
++        if not isinstance(attn_metadata, dict) or kv_cache.numel() == 0:
+             output.zero_()
+             return
+-        md = cast(FlashAttentionMetadata, attn_metadata[self.prefix])
+-        conv_md = conv_metadata(self.conv_state)
++        md = cast(FlashAttentionMetadata, attn_metadata[layer_name])
++        conv_md = conv_metadata(conv_state)
+         assert conv_md is not None
+         num_tokens = q.shape[0]
+         q = q.view(num_tokens, self.num_heads, self.head_dim)
+-        key_cache, value_cache = self._split_kv_cache()
++        key_cache, value_cache = self._split_kv_cache(kv_cache)
+         clipped_q = q.new_empty(q.shape)
+         # Sheared as `rel_attention` reads it (see attention_prologue).
+         rel_logits = q.new_empty(
+@@ -299,7 +378,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+             self.v_sconv.conv_weight,
+             k_dynamic,
+             v_dynamic,
+-            self.conv_state.kv_cache,
++            conv_state.kv_cache,
+             positions,
+             conv_md.block_table,
+             conv_md.seq_idx,
+diff --git a/vllm/models/inkling2/amd/sconv.py b/vllm/models/inkling2/amd/sconv.py
+index 9cedd831e..cbcfd3ec7 100644
+--- a/vllm/models/inkling2/amd/sconv.py
++++ b/vllm/models/inkling2/amd/sconv.py
+@@ -1,5 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# Modified by AEON-7 (2026): from vLLM PR #67685 (head 800f72e235ac, Apache-2.0);
++# `forward` takes an `owner` override (per-loop-pass conv state), as the
++# NVIDIA backend of PR #69028 does.
+ """Inkling2 short convolutions with their state kept in a sliding-window cache.
+ 
+ Each decoder layer owns one `Inkling2ConvState` (Inkling v1's conv state)
+@@ -124,22 +127,26 @@ class Inkling2ShortConv(nn.Module):
+         addend: torch.Tensor | None = None,
+         residual: torch.Tensor | None = None,
+         out: torch.Tensor | None = None,
++        owner: InklingConvState | None = None,
+     ) -> torch.Tensor:
+         """Static conv of `x`; with `addend`, returns `(residual + addend)
+-        + conv(x)` accumulated in fp32 (written to `out` if given)."""
++        + conv(x)` accumulated in fp32 (written to `out` if given). `owner`
++        overrides the conv-state cache (a loop pass after the first)."""
+         assert not self.dynamic
+-        m = conv_metadata(self.owner)
++        if owner is None:
++            owner = self.owner
++        m = conv_metadata(owner)
+         if m is None:
+             # No conv state (profile run): skip the conv, keep the residual sum.
+             if addend is not None:
+                 acc = addend.float() if residual is None else residual + addend.float()
+                 x = (acc + x.to(addend.dtype).float()).to(addend.dtype)
+             return x if out is None else out.copy_(x)
+-        offset, width = self.owner.stream_ranges[self.stream]
++        offset, width = owner.stream_ranges[self.stream]
+         return short_conv(
+             x,
+             self.conv_weight,
+-            self.owner.kv_cache,
++            owner.kv_cache,
+             positions,
+             m.block_table,
+             m.seq_idx,
+-- 
+2.53.0
+

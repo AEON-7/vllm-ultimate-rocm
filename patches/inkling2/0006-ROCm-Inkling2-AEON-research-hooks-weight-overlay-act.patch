@@ -1,0 +1,321 @@
+From c1e83ffed1815285e7b20f6c30301d5926179447 Mon Sep 17 00:00:00 2001
+From: AEON-7 <aeon-7@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:02:02 -0600
+Subject: [PATCH 6/6] [ROCm][Inkling2] AEON research hooks: weight overlay,
+ activation capture, runtime o_proj ablation
+
+Original AEON work. All hooks are off unless their AEON_* variable is set.
+
+- AEON_WEIGHT_OVERLAY: overlay safetensors replace checkpoint tensors of
+  the same name at load (e.g. layers.N.attn.wo_ud.weight), so edited
+  o_proj variants serve without copying the checkpoint.
+- AEON_CAPTURE_DIR / _APPS / _WHAT: per layer application (0..47, looped
+  layers counted per pass) dump of the stream entering the next
+  application and the o_proj input/output at the last prefill row of each
+  request, with positions and last prompt ids for matching.
+- AEON_ABLATE: per-application rank-1 edit of the o_proj output,
+  y - s_a r_a (r_a . y), the runtime form of W = (I - s r r^T) W with a
+  separate scale per loop pass.
+
+Signed-off-by: AEON-7 <aeon-7@users.noreply.github.com>
+---
+ vllm/models/inkling2/amd/aeon_hooks.py | 196 +++++++++++++++++++++++++
+ vllm/models/inkling2/amd/attention.py  |   7 +-
+ vllm/models/inkling2/amd/loop.py       |   4 +
+ vllm/models/inkling2/amd/model.py      |   9 +-
+ 4 files changed, 214 insertions(+), 2 deletions(-)
+ create mode 100644 vllm/models/inkling2/amd/aeon_hooks.py
+
+diff --git a/vllm/models/inkling2/amd/aeon_hooks.py b/vllm/models/inkling2/amd/aeon_hooks.py
+new file mode 100644
+index 000000000..6e7d3693a
+--- /dev/null
++++ b/vllm/models/inkling2/amd/aeon_hooks.py
+@@ -0,0 +1,196 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright 2026 AEON-7
++# Original AEON work.
++"""Research hooks for Inkling-2-Mini on AMD: weight overlays, activation
++capture and runtime rank-1 o_proj ablation. All are off unless their AEON_*
++environment variable is set, and cost nothing when off.
++
++AEON_WEIGHT_OVERLAY=a.safetensors[,b.safetensors]
++    Tensors in the overlay files replace the checkpoint tensors of the same
++    (checkpoint) name at load time, e.g. `model.llm.layers.12.attn.wo_ud.weight`.
++    The stock checkpoint is only read. Shapes and dtypes must match.
++
++AEON_CAPTURE_DIR=/path   AEON_CAPTURE_APPS=0-47 (default all)
++AEON_CAPTURE_WHAT=resid,oproj_in,oproj_out (default all)
++    For every prefill row that is the last token of its request's chunk
++    (query length > 1), dump per layer application (0..47; looped layers
++    6..17 count once per pass: app = 6 + 12 * pass + (layer - 6)):
++      resid     the next visit's input mix (the stream entering the next
++                layer application; for the last app, the final hidden state)
++      oproj_in  the gated attention output fed to wo_ud
++      oproj_out the wo_ud output (after any AEON_ABLATE edit)
++    One file per forward step: step{N}_pid{P}.pt with "positions",
++    "last_ids" (last 8 prompt ids of each row, -1 padded) and the tensors
++    as {kind: {app: [rows, D] fp32}}. Use with prompts that fit one prefill
++    chunk (max_num_batched_tokens) so the captured row is the prompt's last.
++
++AEON_ABLATE=/path/edit.safetensors
++    Keys "dirs" [48, D] (unit-normalised on load) and "scales" [48]: at layer
++    application a, o_proj output y becomes y - scales[a] * r_a (r_a . y), the
++    runtime form of W' = (I - s r r^T) W, with a per-pass scale for the loop.
++"""
++
++from __future__ import annotations
++
++import os
++from collections.abc import Iterable, Iterator
++
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++
++def _parse_apps(spec: str | None) -> set[int]:
++    if not spec:
++        return set(range(48))
++    out: set[int] = set()
++    for part in spec.split(","):
++        if "-" in part:
++            a, b = part.split("-")
++            out.update(range(int(a), int(b) + 1))
++        elif part.strip():
++            out.add(int(part))
++    return out
++
++
++def apply_weight_overlay(
++    weights: Iterable[tuple[str, torch.Tensor]],
++) -> Iterator[tuple[str, torch.Tensor]]:
++    paths = [p for p in os.environ.get("AEON_WEIGHT_OVERLAY", "").split(",") if p]
++    if not paths:
++        yield from weights
++        return
++    from safetensors import safe_open
++
++    overlay: dict[str, tuple[str, str]] = {}
++    for path in paths:
++        with safe_open(path, "pt") as f:
++            for key in f.keys():
++                overlay[key] = (path, key)
++    replaced = 0
++    for name, tensor in weights:
++        if name in overlay:
++            path, key = overlay[name]
++            with safe_open(path, "pt") as f:
++                new = f.get_tensor(key)
++            assert new.shape == tensor.shape and new.dtype == tensor.dtype, (
++                f"overlay {key}: {tuple(new.shape)} {new.dtype} != "
++                f"{tuple(tensor.shape)} {tensor.dtype}"
++            )
++            replaced += 1
++            yield name, new
++        else:
++            yield name, tensor
++    logger.info("AEON overlay: replaced %d tensors from %s", replaced, paths)
++    if replaced != len(overlay):
++        logger.warning(
++            "AEON overlay: %d overlay tensors matched no checkpoint name",
++            len(overlay) - replaced,
++        )
++
++
++class AeonHooks:
++    def __init__(self) -> None:
++        self.capture_dir = os.environ.get("AEON_CAPTURE_DIR") or None
++        self.capture_apps = _parse_apps(os.environ.get("AEON_CAPTURE_APPS"))
++        self.capture_what = set(
++            (os.environ.get("AEON_CAPTURE_WHAT") or "resid,oproj_in,oproj_out").split(",")
++        )
++        self.ablate_path = os.environ.get("AEON_ABLATE") or None
++        self.enabled = bool(self.capture_dir or self.ablate_path)
++        self.visit = -1
++        self.rows: torch.Tensor | None = None
++        self.step = 0
++        self.buf: dict[str, dict[int, torch.Tensor]] = {}
++        self.meta: dict[str, torch.Tensor] = {}
++        self._dirs: torch.Tensor | None = None
++        self._scales: list[float] = []
++        if self.capture_dir:
++            os.makedirs(self.capture_dir, exist_ok=True)
++
++    # -- runtime ablation ---------------------------------------------------
++    def _load_ablation(self, device: torch.device) -> None:
++        from safetensors.torch import load_file
++
++        t = load_file(self.ablate_path)
++        dirs = t["dirs"].float()
++        self._dirs = (dirs / dirs.norm(dim=-1, keepdim=True).clamp_min(1e-12)).to(device)
++        self._scales = [float(s) for s in t["scales"].float().tolist()]
++        logger.info("AEON ablation: %s, nonzero apps %s", self.ablate_path,
++                    [a for a, s in enumerate(self._scales) if s != 0.0])
++
++    # -- step bookkeeping ---------------------------------------------------
++    def begin_step(self, input_ids: torch.Tensor | None, positions: torch.Tensor) -> None:
++        self.visit = -1
++        self.rows = None
++        if not self.capture_dir:
++            return
++        from vllm.forward_context import get_forward_context, is_forward_context_available
++
++        if not is_forward_context_available():
++            return
++        md_all = get_forward_context().attn_metadata
++        if not isinstance(md_all, dict):
++            return
++        qsl = None
++        for md in md_all.values():
++            qsl = getattr(md, "query_start_loc", None)
++            if qsl is not None:
++                break
++        if qsl is None:
++            return
++        qsl = qsl.long()
++        lens = qsl[1:] - qsl[:-1]
++        ends = qsl[1:] - 1
++        rows = ends[lens > 1]
++        if rows.numel() == 0:
++            return
++        self.rows = rows
++        self.buf = {}
++        self.meta = {"positions": positions[rows].cpu()}
++        if input_ids is not None:
++            idx = rows[:, None] - torch.arange(7, -1, -1, device=rows.device)[None]
++            starts = qsl[:-1][lens > 1][:, None]
++            ids = torch.where(idx >= starts, input_ids[idx.clamp_min(0)], -1)
++            self.meta["last_ids"] = ids.cpu()
++
++    def _keep(self, kind: str) -> bool:
++        return (
++            self.rows is not None
++            and kind in self.capture_what
++            and self.visit in self.capture_apps
++        )
++
++    def _put(self, kind: str, x: torch.Tensor) -> None:
++        self.buf.setdefault(kind, {})[self.visit] = x[self.rows].float().cpu()
++
++    def oproj(self, attn_out: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
++        if self.ablate_path and self.visit >= 0:
++            if self._dirs is None:
++                self._load_ablation(y.device)
++            s = self._scales[self.visit] if self.visit < len(self._scales) else 0.0
++            if s != 0.0:
++                r = self._dirs[self.visit].to(y.dtype)
++                y = y - s * (y @ r)[:, None] * r[None]
++        if self._keep("oproj_in"):
++            self._put("oproj_in", attn_out)
++        if self._keep("oproj_out"):
++            self._put("oproj_out", y)
++        return y
++
++    def resid(self, x: torch.Tensor) -> None:
++        if self._keep("resid"):
++            self._put("resid", x)
++
++    def end_step(self) -> None:
++        if self.capture_dir and self.rows is not None and self.buf:
++            path = os.path.join(self.capture_dir, f"step{self.step:06d}_pid{os.getpid()}.pt")
++            torch.save({**self.meta, **self.buf}, path)
++            self.step += 1
++        self.rows = None
++        self.visit = -1
++
++
++HOOKS = AeonHooks()
+diff --git a/vllm/models/inkling2/amd/attention.py b/vllm/models/inkling2/amd/attention.py
+index c9e39bdab..85de2b972 100644
+--- a/vllm/models/inkling2/amd/attention.py
++++ b/vllm/models/inkling2/amd/attention.py
+@@ -19,6 +19,8 @@ from vllm.distributed import (
+     get_tensor_model_parallel_world_size,
+ )
+ from vllm.forward_context import get_forward_context
++
++from .aeon_hooks import HOOKS
+ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+ from vllm.model_executor.layers.linear import (
+     MergedColumnParallelLinear,
+@@ -323,7 +325,10 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+             output,
+             pass_idx,
+         )
+-        return nn.functional.linear(output, self.wo_ud.weight)
++        out = nn.functional.linear(output, self.wo_ud.weight)
++        if HOOKS.enabled:
++            out = HOOKS.oproj(output, out)
++        return out
+ 
+     @eager_break_during_capture
+     def _attention(
+diff --git a/vllm/models/inkling2/amd/loop.py b/vllm/models/inkling2/amd/loop.py
+index 5fa908ba2..6afecf0fb 100644
+--- a/vllm/models/inkling2/amd/loop.py
++++ b/vllm/models/inkling2/amd/loop.py
+@@ -23,6 +23,7 @@ from torch import nn
+ 
+ from vllm.distributed import tensor_model_parallel_all_reduce
+ 
++from .aeon_hooks import HOOKS
+ from ..configs import Inkling2ModelConfig
+ from ..quant_config import Inkling2QuantConfig
+ from .model import (
+@@ -355,6 +356,7 @@ class Inkling2LoopModel(Inkling2Model):
+                 next_query = self.attn_res.attn_queries[next_i - 1]
+                 # Messages blend into fp32 mixes; a pass restart discards it.
+                 next_norm = None if next_pass else self.layers[next_i].attn_norm
++            HOOKS.visit = visit
+             num_blocks, inputs = self._run_layer(
+                 i,
+                 pass_idx,
+@@ -367,6 +369,8 @@ class Inkling2LoopModel(Inkling2Model):
+                 positions,
+                 tau,
+             )
++            if HOOKS.enabled:
++                HOOKS.resid(inputs[0])
+         assert inputs is not None
+         out = inputs[0]
+         if self.aux_hidden_state_layers:
+diff --git a/vllm/models/inkling2/amd/model.py b/vllm/models/inkling2/amd/model.py
+index 2cfacc93e..bf0429f33 100644
+--- a/vllm/models/inkling2/amd/model.py
++++ b/vllm/models/inkling2/amd/model.py
+@@ -53,6 +53,7 @@ from ..processing import (
+     Inkling2ProcessingInfo,
+ )
+ from ..quant_config import Inkling2QuantConfig
++from .aeon_hooks import HOOKS, apply_weight_overlay
+ from .attention import Inkling2Attention
+ from .moe import Inkling2MoE
+ from .moe_gfx12 import Inkling2Gfx12MoE
+@@ -574,7 +575,12 @@ class Inkling2ForConditionalGeneration(
+         if inputs_embeds is None:
+             assert input_ids is not None
+             inputs_embeds = self.model.embed_input_ids(input_ids)
+-        return self.model(positions, inputs_embeds)
++        if not HOOKS.enabled:
++            return self.model(positions, inputs_embeds)
++        HOOKS.begin_step(input_ids, positions)
++        out = self.model(positions, inputs_embeds)
++        HOOKS.end_step()
++        return out
+ 
+     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+         return self.logits_processor(self.lm_head, hidden_states)
+@@ -588,6 +594,7 @@ class Inkling2ForConditionalGeneration(
+             "attn_queries": num_layers - 1,
+             "mlp_queries": num_layers,
+         }
++        weights = apply_weight_overlay(weights)
+         loaded: set[str] = set()
+         loaded_shards: set[tuple[str, int]] = set()
+         visual_weights: list[tuple[str, torch.Tensor]] = []
+-- 
+2.53.0
+
