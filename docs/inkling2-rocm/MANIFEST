@@ -1,0 +1,115 @@
+AEON Inkling-2-Mini ROCm image manifest
+=======================================
+
+This file is copied into the image at /opt/aeon/MANIFEST.
+
+Image purpose
+-------------
+From-source vLLM ROCm build of the cleanroom Inkling-2-Mini engine,
+matching the center venv at ~/inkling/engines/aeon-cleanroom
+(TheRock ROCm 10.0.0, torch 2.13.0+rocm10.0.0, Python 3.14, gfx1201).
+
+This is not the older GHCR early-access image
+ghcr.io/aeon-7/aeon-vllm-ultimate-rocm:2026-10-06-v0.31.0-x86-early-access
+(that one is official vLLM v0.31.0 + ROCm 7.2.3 + two Qwen Python patches).
+
+Source tree
+-----------
+Checkout:  ~/inkling/engines/aeon-docker
+Branch:    inkling2-rocm-r6-docker
+Tip:       0714f860c9b99afd3d3fb94e25d11e1230b714f2
+Subject:   [AEON R6-1] inkling2: r5_bake --readers all (residual apps 41-47 into every later bf16/fp32 reader), CPU test, GPU bake-vs-hook validation
+Base:      vllm-project/vllm 1fd30e4f6e8fd621ac68cf44fb36bfe710646a69 (main at clone time)
+Worktrees that were not edited: aeon-cleanroom/vllm (aeon-m2), wt-abl, wt-r5, wt-r6.
+
+Stack pins (must match the venv)
+--------------------------------
+Python:              3.14
+ROCm SDK:            10.0.0 (TheRock wheels: rocm[libraries,devel,device-gfx1201])
+torch:               2.13.0+rocm10.0.0  with amd-torch-device-gfx1201
+torchvision:         0.28.0+rocm10.0.0
+PYTORCH_ROCM_ARCH:   gfx1201
+VLLM_TARGET_DEVICE:  rocm
+VLLM_ROCM_USE_AITER: 0
+HSA_ENABLE_SDMA:     0
+GPU_MAX_HW_QUEUES:   1
+TRITON_CACHE_DIR:    /root/.cache/triton
+PYTORCH_CUDA_ALLOC_CONF / PYTORCH_HIP_ALLOC_CONF / PYTORCH_ALLOC_CONF: unset
+Never set expandable_segments.
+
+Build
+-----
+From this checkout, once Docker is installed:
+
+  docker buildx bake -f docker/docker-bake-rocm.hcl aeon
+
+Default tag: ghcr.io/aeon-7/aeon-vllm-ultimate-rocm:inkling2-r6
+Serve with --network host, --device /dev/kfd, --device /dev/dri,
+--group-add video --group-add render, and at most 0.80 gpu-memory-utilization
+so each GPU keeps at least 15% VRAM free. Do not stop other serves.
+
+Commit list (main..HEAD, oldest first)
+--------------------------------------
+18f064eaa9671201cddc169b2d1824f4ededbb62  0001  [ROCm][Model] Add Inkling 2 Small support on ROCm
+5a9bb114cdea39cfe496a8c2e14fe7f746415f75  0002  [ROCm][Inkling2] Loop ops for the AMD package: blend norms and fp32 AttnRes mixes
+c1e377c4a27dd53d5e035526c04dbdd01f2678c8  0003  [ROCm][Inkling2] NVFP4 and MXFP8 routed experts on RDNA4 (gfx12)
+1024520931110d9c31306732264cd3bf727cf895  0004  [ROCm][Inkling2] Per-pass KV caches and conv states for looped layers
+5ee19db4e323a65eb7104a7123ce5ccd9f78d1bc  0005  [ROCm][Inkling2] Inkling-2-Mini (inkling2_loop) on RDNA4 and CDNA
+c1e83ffed1815285e7b20f6c30301d5926179447  0006  [ROCm][Inkling2] AEON research hooks: weight overlay, activation capture, runtime o_proj ablation
+2c292c3d412013eb73dda9f6cc55e4686f0bc193  0007  [AEON M2] inkling2 gfx12: decode MoE (fused router + per-expert GEMV) for T<=16
+e7e1c880421e28f8329c486a8341e675e03927b3  0008  [AEON M2] inkling2 gfx12: fused decode loop-controller blend; single HW queue on ROCm
+70e97ec3cf466840c69a9631c8129cf0823b6d0f  0009  [ROCm][Inkling2] AEON per-request multi-variant o_proj ablation
+6a8ec4610d15022fad2a420746a5e83dfde62b43  0010  [AEON M2] inkling2 gfx12: small-M bf16 GEMV for qkvr/o_proj/dynamic taps; multi-row decode MoE
+9de5cc6ecfc163f7a58a0c8fb969381cb4badc61  0011  [AEON M2] inkling2 gfx12: fused router+sort top-k, dot-path MoE for shared experts, MXFP8 hybrid decode, fused combine/norm, split-KV merge in attention
+ce1f64f961d714dccba61409e6cd12da11933b77  0012  [AEON M2] inkling2 gfx12: fuse static short conv with the following attn-res mix (T<=8); MoE T=1 retune
+d48e62a277ca0cc15cccaff1e8d3c8e9de5e0f28  0013  [AEON M2] inkling2 gfx12: K/V tap projections in the qkvr GEMV launch; one message mix per loop pass
+a76700f7f24b5995dfdbc0475733b4a89b02a59b       Merge commit 70e97ec3c into aeon-m2 (no patch file; merge only)
+c1d310e97f28f2a20916d4fb7bbb1435d0652c5f  0014  [AEON M2] inkling2 gfx12: batch-invariant MoE mode for ablation variant servers
+4d43fb64f5015dbe75af5e22c9521ae5afbd8f5c  0015  [AEON M3] inkling2 ROCm: DSpark draft KV write via the cache op (no flash-attn varlen module on ROCm)
+21add0ba8db5abe40a90ef20709f6a0a95ed31e6  0016  [AEON M3] inkling2 ROCm: DSpark draft dense layers on the AEON small-M GEMV (<= 8 rows)
+3a363b4e9e75d29c45381901944421c83003916e  0017  [AEON R5-1] inkling2 ROCm: per-request residual-stream variant edits
+0714f860c9b99afd3d3fb94e25d11e1230b714f2  0018  [AEON R6-1] inkling2: r5_bake --readers all (residual apps 41-47 into every later bf16/fp32 reader), CPU test, GPU bake-vs-hook validation
+
+Patch files in this image (/opt/aeon/patches/inkling2)
+-----------------------------------------------------
+0001-0006: the cleanroom series from ~/inkling/engines/aeon-cleanroom/patches/inkling2.
+  Verified: they apply in order, cleanly, onto 1fd30e4f6. They are already in this
+  tree as the six commits above. Later commits edited the same files, so the
+  original patch files do not reverse-apply onto HEAD.
+
+0007-0018: git format-patch of c1e83ffed..HEAD (merge a76700f7f omitted, as
+  format-patch skips merges). End state is 0714f860c.
+
+Note on numbering vs https://github.com/AEON-7/vllm-ultimate-rocm PRs #2-#6:
+  Those PRs numbered the ablation patch as 0013 (after the M2 kernel patches)
+  because they reordered it for the stacked patch series. This image's 0009 is
+  the same ablation commit 70e97ec3c, and 0018 is the new R6 patch (not yet
+  in those PRs). Feature set at HEAD is the union of PRs #2-#6 plus R6.
+
+Features included
+-----------------
+- Inkling 2 Small + Inkling-2-Mini (inkling2_loop) on gfx1201 (R9700)
+- NVFP4 / MXFP8 routed experts, loop ops, per-pass KV and conv state
+- AEON research hooks: weight overlay, activation capture, runtime o_proj ablation
+- M2 gfx12 decode kernels (MoE, GEMV, fused blend/router/sconv, K/V taps)
+- Multi-variant per-request o_proj ablation
+- Mixed-batch determinism: batch-invariant MoE mode (c1d310e97, VLLM_BATCH_INVARIANT)
+  There is no separately named "exact mode" commit; this is that work.
+- DSpark (opt-in at serve time via speculative-config; AEON_DSPARK_GEMV defaults to 1)
+- R5 per-request residual-stream variant edits
+- R6 r5_bake --readers all, plus CPU and GPU bake-vs-hook tools
+- tools/inkling2: r5_bake.py, test_r5_bake.py, test_r6_bake.py, r6_validate.py, r6_run.sh
+- /opt/aeon/scripts: cleanroom aeon/ validation and unit scripts (57 files)
+- env.sh flags baked as image ENV (see stack pins). No expandable_segments.
+
+Env that was in env.sh and is baked into the image
+--------------------------------------------------
+PYTORCH_ROCM_ARCH=gfx1201
+VLLM_TARGET_DEVICE=rocm
+VLLM_NO_USAGE_STATS=1
+VLLM_ROCM_USE_AITER=0
+HSA_ENABLE_SDMA=0
+GPU_MAX_HW_QUEUES=1
+TRITON_CACHE_DIR=/root/.cache/triton
+The entrypoint unsets PYTORCH_CUDA_ALLOC_CONF, PYTORCH_HIP_ALLOC_CONF, and
+PYTORCH_ALLOC_CONF so a caller cannot turn on expandable_segments by accident.

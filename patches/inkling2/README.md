@@ -101,3 +101,5 @@ batches are bitwise equal to running alone. The bakeable subset (apps 0-4, 41-47
 stock-format weights with `tools/r5_bake.py`. See `docs/inkling2-rocm/R5_RESIDUAL.md`. Tools:
 `tools/r5_bake.py`, `tools/test_r5_bake.py`, `tools/r5_validate.py` + `tools/r5_run.sh`,
 `tools/r5_unit*.py`, `tools/r5_bake_analysis.py`; results in `tools/r5_results/`.
+
+0018: R6-1 r5_bake --readers all (residual apps 41-47 into later bf16/fp32 readers), CPU test, GPU bake-vs-hook validation. Commit 0714f860c.
