@@ -1,5 +1,23 @@
 # AEON vLLM Ultimate ROCm (x86)
 
+## Quick start (Docker, gfx1201)
+
+This branch documents the Inkling-2-Mini from-source gfx1201 image
+(TheRock ROCm 10.0.0, torch 2.13.0+rocm10.0.0, Python 3.14). The image
+is published at `ghcr.io/aeon-7/aeon-vllm-ultimate-rocm` with tags
+`inkling2-r6` and `inkling2-r6-gfx1201-2026-11-25`.
+
+```
+docker pull ghcr.io/aeon-7/aeon-vllm-ultimate-rocm:inkling2-r6
+```
+
+Serve recipes (stock and overlay, TP=1 and TP=2, DSpark opt-in,
+multi-variant ablation, VRAM and env flags) are in
+`docs/inkling2-rocm/RECIPES.md`. Build notes and the stack pin list are
+in `docs/inkling2-rocm/DOCKER.md` and `docs/inkling2-rocm/MANIFEST`.
+
+The older Qwen early-access image on main is unchanged.
+
 [![Buy me a coffee on LotusMake](https://lotusmake.com/badges/coffee-light.v2.svg)](https://lotusmake.com/support) [![Subscribe on lotusmake.com](https://lotusmake.com/badges/subscribe-light.v2.svg)](https://lotusmake.com/support?mode=tiers)
 
 Early access. Pending community testing. This is not a final release.
