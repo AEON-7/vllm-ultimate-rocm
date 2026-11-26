@@ -21,6 +21,8 @@ variable "CACHE"        { default = "" }       # trusted cache repo (rocm/vllm-c
 variable "CACHE_TO"     { default = "" }       # ref prefix this build writes ("" = none); build.sh sets it per repo
 variable "AITER_SPEC"   { default = "" }       # pins the AITER nightly wheel (pip spec)
 variable "AITER_NIGHTLY" { default = "" }      # "1": test the newest AITER nightly wheel
+variable "AITER_PREBUILD_KERNELS" { default = "0" }  # AEON: VLLM_ROCM_USE_AITER=0, skip JIT prebuild
+variable "AITER_GPU_ARCHS" { default = "gfx1201" }   # do not pass AITER_ROCM_ARCH (that ENV is on base)
 variable "VLLM_VERSION" { default = "" }       # release: image version label (build.sh reuse check)
 variable "CACHE_CI"     { default = true }     # false (PR builds): skip the full ci cache; compile-cache still exports
 variable "BUILDKITE_COMMIT" { default = "" }   # the commit the kernel symbol map is stamped with
@@ -65,7 +67,8 @@ target "_rocm" {
 target "_stack" {
   inherits   = ["_rocm"]
   target     = "final"
-  args       = { FA_ROCM_ARCH = CACHE == "" ? "" : CI_ARCH, PYTORCH_ROCM_ARCH = PYTORCH_ROCM_ARCH }   # AEON default: gfx1201
+  args       = { FA_ROCM_ARCH = CACHE == "" ? "" : CI_ARCH, PYTORCH_ROCM_ARCH = PYTORCH_ROCM_ARCH,
+                 AITER_PREBUILD_KERNELS = AITER_PREBUILD_KERNELS, AITER_GPU_ARCHS = AITER_GPU_ARCHS }   # AEON default: gfx1201, no AITER JIT prebuild
   tags       = [TAG]
   cache-from = cfrom(["stack"])
   cache-to   = cto("stack")

@@ -213,6 +213,13 @@ RUN mkdir -p /app/install && cp /app/flash-attention/dist/*.whl /app/install
 FROM base AS build_aiter
 ARG AITER_BRANCH
 ARG AITER_REPO
+# Declared only in this stage so changing them does not bust base / FlashAttention / Triton cache.
+# AEON image sets VLLM_ROCM_USE_AITER=0, so the wheel is installed without the JIT prebuild
+# (which otherwise compiles gfx942/gfx950 modules for hours). Override to 1 / another arch
+# if a later image needs prebuilt AITER kernels. vLLM csrc and FlashAttention still use
+# PYTORCH_ROCM_ARCH / FA_ROCM_ARCH (gfx1201 in the AEON bake).
+ARG AITER_PREBUILD_KERNELS=1
+ARG AITER_GPU_ARCHS=""
 RUN git clone --recursive --branch ${AITER_BRANCH} ${AITER_REPO}
 RUN --mount=type=cache,target=/root/.cache/pip cd aiter \
     && git submodule update --init --recursive \
@@ -220,7 +227,7 @@ RUN --mount=type=cache,target=/root/.cache/pip cd aiter \
 # AITER_USE_SYSTEM_TRITON keeps setup.py from resolving its own triton, which would
 # displace the pinned one already installed in base.
 RUN --mount=type=cache,target=/root/.cache/pip pip install pyyaml && cd aiter \
-    && PREBUILD_KERNELS=1 AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${AITER_ROCM_ARCH} python3 setup.py bdist_wheel --dist-dir=dist \
+    && PREBUILD_KERNELS=${AITER_PREBUILD_KERNELS} AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${AITER_GPU_ARCHS:-${AITER_ROCM_ARCH}} python3 setup.py bdist_wheel --dist-dir=dist \
     && ls /app/aiter/dist/*.whl
 RUN mkdir -p /app/install && cp /app/aiter/dist/*.whl /app/install
 
