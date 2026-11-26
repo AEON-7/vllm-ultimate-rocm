@@ -1,0 +1,556 @@
+From c1e377c4a27dd53d5e035526c04dbdd01f2678c8 Mon Sep 17 00:00:00 2001
+From: AEON-7 <aeon-7@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 18:59:05 -0600
+Subject: [PATCH 3/6] [ROCm][Inkling2] NVFP4 and MXFP8 routed experts on RDNA4
+ (gfx12)
+
+Original AEON work (clean room, from docs/inkling2-rocm/SPEC.md).
+RDNA4 has no FP4 MMA and the upstream MXFP8 path needs gfx950
+tl.dot_scaled, so experts are served from the checkpoint packed weights
+with in-register decode to bf16 and bf16 WMMA:
+
+- ops/moe_dequant.py: bit-exact E2M1/E4M3/E8M0 decoders, grouped expert
+  GEMM with fused softcapped SwiGLU (reference rounding: bf16 GEMM out,
+  fp32 activation, bf16), row gather by sorted routing, deterministic
+  fp32 top-k combine. Host-sync free tile planning.
+- moe_gfx12.py: fp32 sigmoid router with score-correction bias and
+  route_scale, expert params named like upstream nvidia/moe.py, EP = TP
+  sharding. w13 gate/up rows are de-interleaved once at load (the
+  checkpoint interleaves them, as the transformers converter documents).
+
+Signed-off-by: AEON-7 <aeon-7@users.noreply.github.com>
+---
+ vllm/models/inkling2/amd/moe_gfx12.py       | 176 ++++++++++
+ vllm/models/inkling2/amd/ops/moe_dequant.py | 337 ++++++++++++++++++++
+ 2 files changed, 513 insertions(+)
+ create mode 100644 vllm/models/inkling2/amd/moe_gfx12.py
+ create mode 100644 vllm/models/inkling2/amd/ops/moe_dequant.py
+
+diff --git a/vllm/models/inkling2/amd/moe_gfx12.py b/vllm/models/inkling2/amd/moe_gfx12.py
+new file mode 100644
+index 000000000..1035356bb
+--- /dev/null
++++ b/vllm/models/inkling2/amd/moe_gfx12.py
+@@ -0,0 +1,176 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright 2026 AEON-7
++# Original AEON work (clean room, written from AEON SPEC.md section 3). The
++# parameter names and checkpoint layout follow upstream vLLM
++# `vllm/models/inkling2/nvidia/moe.py` (PR #69028, Apache-2.0).
++"""Inkling2 mixture-of-experts layer for RDNA4 (gfx12): NVFP4 or MXFP8
++routed experts served from the checkpoint's packed weights, BF16
++activations, in-register weight decode (`ops.moe_dequant`).
++
++Routing follows the reference: fp32 router logits, sigmoid scores, top-k of
++`scores + bias`, weights normalized over the picks and scaled by
++`route_scale`. TP shards the experts contiguously (EP = TP) and all-reduces
++the bf16 output.
++"""
++
++from typing import Literal
++
++import torch
++from torch import nn
++
++from vllm.distributed import (
++    get_tensor_model_parallel_rank,
++    get_tensor_model_parallel_world_size,
++    tensor_model_parallel_all_reduce,
++)
++from vllm.model_executor.model_loader.weight_utils import default_weight_loader
++from vllm.model_executor.utils import set_weight_attrs
++
++from .ops.moe_dequant import expert_mlp
++
++QuantFormat = Literal["nvfp4", "mxfp8"]
++
++
++class Inkling2Gfx12Gate(nn.Module):
++    def __init__(self, config) -> None:
++        super().__init__()
++        assert config.use_gate_bias
++        num_experts, hidden = config.n_routed_experts, config.hidden_size
++        self.topk = config.num_experts_per_tok
++        self.route_scale = config.route_scale
++        self.weight = nn.Parameter(
++            torch.empty(num_experts, hidden, dtype=torch.bfloat16),
++            requires_grad=False,
++        )
++        self.bias = nn.Parameter(
++            torch.empty(num_experts, dtype=torch.float32), requires_grad=False
++        )
++        for param in (self.weight, self.bias):
++            set_weight_attrs(param, {"weight_loader": default_weight_loader})
++        self.register_buffer("weight_f32", torch.empty(0), persistent=False)
++
++    def process_weights_after_loading(self) -> None:
++        self.weight_f32 = self.weight.data.float()
++
++    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        """Top-k expert ids (int64) and fp32 routing weights of bf16 `x`."""
++        weight = self.weight_f32 if self.weight_f32.numel() else self.weight.float()
++        logits = torch.mm(x.float(), weight.t())
++        scores = torch.sigmoid(logits)
++        ids = torch.topk(scores + self.bias, self.topk, dim=-1, sorted=False).indices
++        weights = scores.gather(1, ids)
++        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
++        return ids, weights * self.route_scale
++
++
++class Inkling2Gfx12Experts(nn.Module):
++    def __init__(self, config, quant_format: QuantFormat) -> None:
++        super().__init__()
++        self.ep_rank = get_tensor_model_parallel_rank()
++        self.ep_size = get_tensor_model_parallel_world_size()
++        assert config.n_routed_experts % self.ep_size == 0
++        self.num_experts = config.n_routed_experts // self.ep_size
++        self.topk = config.num_experts_per_tok
++        self.gate_cap = float(config.mlp_gate_softcap)
++        self.up_cap = float(config.mlp_up_softcap)
++        self.nvfp4 = quant_format == "nvfp4"
++        hidden, inter = config.hidden_size, config.intermediate_size
++        pack, group = (2, 16) if self.nvfp4 else (1, 32)
++        weight_dtype = torch.uint8 if self.nvfp4 else torch.float8_e4m3fn
++        scale_dtype = torch.float8_e4m3fn if self.nvfp4 else torch.uint8
++        for name, (n, k) in (("w13", (2 * inter, hidden)), ("w2", (hidden, inter))):
++            self._register(f"{name}_weight", (n, k // pack), weight_dtype)
++            self._register(f"{name}_weight_scale", (n, k // group), scale_dtype)
++            if self.nvfp4:
++                self._register(f"{name}_weight_amax", (), torch.float32)
++                self._register(
++                    f"{name}_weight_outer_scale_denominator",
++                    (1,),
++                    torch.float32,
++                    per_expert=False,
++                )
++        self.global_scales: dict[str, torch.Tensor] = {}
++
++    def _register(
++        self,
++        name: str,
++        shape: tuple[int, ...],
++        dtype: torch.dtype,
++        per_expert: bool = True,
++    ) -> None:
++        if per_expert:
++            shape = (self.num_experts, *shape)
++        param = nn.Parameter(torch.empty(shape, dtype=dtype), requires_grad=False)
++        loader = self._load_expert_shard if per_expert else self._load_full
++        set_weight_attrs(param, {"weight_loader": loader})
++        self.register_parameter(name, param)
++
++    def _load_expert_shard(self, param: nn.Parameter, loaded: torch.Tensor) -> None:
++        start = self.ep_rank * self.num_experts
++        self._load_full(param, loaded[start : start + self.num_experts])
++
++    @staticmethod
++    def _load_full(param: nn.Parameter, loaded: torch.Tensor) -> None:
++        assert loaded.shape == param.shape and loaded.dtype == param.dtype, (
++            f"{loaded.shape} {loaded.dtype} != {param.shape} {param.dtype}"
++        )
++        param.data.copy_(loaded)
++
++    def process_weights_after_loading(self) -> None:
++        # The checkpoint interleaves the gate and up rows of w13 (row 2i is
++        # gate i, row 2i + 1 is up i); the kernel reads [gate; up] halves.
++        # De-interleave the weight and its block scales once, in place.
++        for name in ("w13_weight", "w13_weight_scale"):
++            param = getattr(self, name)
++            e, n, k = param.shape
++            halves = param.data.view(e, n // 2, 2, k).transpose(1, 2).contiguous()
++            param.data.copy_(halves.view(e, n, k))
++            del halves
++        if self.nvfp4:
++            for name in ("w13", "w2"):
++                amax = getattr(self, f"{name}_weight_amax").data.float()
++                denom = getattr(self, f"{name}_weight_outer_scale_denominator").data
++                self.global_scales[name] = (amax / denom.float()).contiguous()
++
++    def _operands(self, name: str):
++        weight = getattr(self, f"{name}_weight").data
++        scale = getattr(self, f"{name}_weight_scale").data
++        return (
++            weight.view(torch.uint8),
++            scale.view(torch.uint8),
++            self.global_scales.get(name),
++        )
++
++    def forward(
++        self, x: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor
++    ) -> torch.Tensor:
++        if self.ep_size > 1:
++            start = self.ep_rank * self.num_experts
++            local = (ids >= start) & (ids < start + self.num_experts)
++            weights = torch.where(local, weights, torch.zeros_like(weights))
++            ids = torch.where(local, ids - start, torch.zeros_like(ids))
++        out = expert_mlp(
++            x,
++            ids,
++            weights,
++            self._operands("w13"),
++            self._operands("w2"),
++            0 if self.nvfp4 else 1,
++            self.gate_cap,
++            self.up_cap,
++        )
++        return out if self.ep_size == 1 else tensor_model_parallel_all_reduce(out)
++
++
++class Inkling2Gfx12MoE(nn.Module):
++    def __init__(self, config, quant_format: QuantFormat) -> None:
++        super().__init__()
++        assert config.n_shared_experts == 0
++        self.gate = Inkling2Gfx12Gate(config)
++        self.experts = Inkling2Gfx12Experts(config, quant_format)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        """bf16 [T, H] -> bf16 [T, H]."""
++        x = x.contiguous()
++        ids, weights = self.gate(x)
++        return self.experts(x, ids, weights)
+diff --git a/vllm/models/inkling2/amd/ops/moe_dequant.py b/vllm/models/inkling2/amd/ops/moe_dequant.py
+new file mode 100644
+index 000000000..8becc25c0
+--- /dev/null
++++ b/vllm/models/inkling2/amd/ops/moe_dequant.py
+@@ -0,0 +1,337 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright 2026 AEON-7
++# Original AEON work (clean room, written from AEON SPEC.md sections 3.1-3.3).
++"""Inkling2 expert GEMMs for RDNA4 (gfx12) on the checkpoint's packed weights.
++
++gfx12 has no FP4 matrix math and no block-scaled dot, so each program decodes
++its weight tile in registers to bf16 and feeds `tl.dot` with bf16 operands
++(fp32 accumulate). Activations stay bf16 (no activation quantization).
++
++Formats (as stored, never repacked):
++- NVFP4 (fmt 0): `W` uint8 [E, N, K/2], two e2m1 codes per byte, low nibble
++  first; `S` e4m3 bytes [E, N, K/16]; per-expert fp32 `G` = amax / denom.
++  w = bf16((e2m1 * e4m3) * G), the reference dequantization order.
++- MXFP8 (fmt 1): `W` e4m3 bytes [E, N, K]; `S` e8m0 bytes [E, N, K/32].
++  w = bf16(e4m3 * 2^(s - 127)).
++
++All decodes build fp32 values from bits (exact). Rows are expert-sorted
++(token, slot) pairs; `TileExpert[t]` (-1 = unused), `TileRow0[t]` and
++`TileRowEnd[t]` describe BM-row tiles of one expert each.
++"""
++
++import torch
++
++from vllm.triton_utils import tl, tldevice, triton
++
++
++@triton.jit
++def _e2m1_to_f32(code):
++    # code: int32 in [0, 16). |v| in {0, .5, 1, 1.5, 2, 3, 4, 6}.
++    mag = code & 7
++    ex = mag >> 1
++    man = mag & 1
++    # Normal (ex >= 1): (1 + man/2) * 2^(ex-1) -> fp32 bits.
++    normal = (((ex + 126) << 23) | (man << 22)).to(tl.float32, bitcast=True)
++    sub = man.to(tl.float32) * 0.5
++    val = tl.where(ex == 0, sub, normal)
++    return tl.where((code & 8) != 0, -val, val)
++
++
++@triton.jit
++def _e4m3_to_f32(b):
++    # b: int32 byte of an OCP e4m3 (float8_e4m3fn) value.
++    sign = (b >> 7) & 1
++    ex = (b >> 3) & 15
++    man = b & 7
++    normal = ((sign << 31) | ((ex + 120) << 23) | (man << 20)).to(
++        tl.float32, bitcast=True
++    )
++    sub = man.to(tl.float32) * 0.001953125  # man * 2^-9
++    sub = tl.where(sign != 0, -sub, sub)
++    return tl.where(ex == 0, sub, normal)
++
++
++@triton.jit
++def _e8m0_to_f32(s):
++    # s: int32 biased exponent byte; 2^(s - 127). s = 0 -> 2^-127 (subnormal).
++    return tl.where(
++        s == 0,
++        (s * 0 + 0x00400000).to(tl.float32, bitcast=True),
++        (s << 23).to(tl.float32, bitcast=True),
++    )
++
++
++@triton.jit
++def _weight_tile(
++    W,
++    S,
++    G,
++    expert,
++    n_idx,
++    n_mask,
++    k0,
++    N: tl.constexpr,
++    K: tl.constexpr,
++    FMT: tl.constexpr,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++):
++    """bf16 [BN, BK] tile of expert `expert`'s dequantized weight, rows
++    `n_idx`, columns [k0, k0 + BK)."""
++    row = (expert * N + n_idx[:, None]).to(tl.int64)
++    if FMT == 0:
++        kb = k0 // 2 + tl.arange(0, BK // 2)
++        packed = tl.load(W + row * (K // 2) + kb[None, :], n_mask[:, None], other=0)
++        packed = packed.to(tl.int32)
++        lo = _e2m1_to_f32(packed & 15)
++        hi = _e2m1_to_f32((packed >> 4) & 15)
++        vals = tl.reshape(tl.join(lo, hi), (BN, BK))
++        ks = k0 // 16 + tl.arange(0, BK // 16)
++        sb = tl.load(S + row * (K // 16) + ks[None, :], n_mask[:, None], other=0)
++        scale = _e4m3_to_f32(sb.to(tl.int32))
++        scale = tl.reshape(tl.broadcast_to(scale[:, :, None], (BN, BK // 16, 16)), (BN, BK))
++        g = tl.load(G + expert)
++        w = (vals * scale) * g
++    else:
++        kk = k0 + tl.arange(0, BK)
++        b = tl.load(W + row * K + kk[None, :], n_mask[:, None], other=0)
++        vals = _e4m3_to_f32(b.to(tl.int32))
++        ks = k0 // 32 + tl.arange(0, BK // 32)
++        sb = tl.load(S + row * (K // 32) + ks[None, :], n_mask[:, None], other=0)
++        scale = _e8m0_to_f32(sb.to(tl.int32))
++        scale = tl.reshape(tl.broadcast_to(scale[:, :, None], (BN, BK // 32, 32)), (BN, BK))
++        w = vals * scale
++    return w.to(tl.bfloat16)
++
++
++@triton.jit
++def _softcap(x, CAP: tl.constexpr):
++    return tldevice.tanh(x / CAP) * CAP
++
++
++@triton.jit
++def _expert_gemm_kernel(
++    X,
++    Order,
++    W,
++    S,
++    G,
++    Out,
++    TileExpert,
++    TileRow0,
++    TileRowEnd,
++    TOPK: tl.constexpr,
++    N: tl.constexpr,
++    K: tl.constexpr,
++    OUT_N: tl.constexpr,
++    FMT: tl.constexpr,
++    GATED: tl.constexpr,
++    GATHER: tl.constexpr,
++    GATE_CAP: tl.constexpr,
++    UP_CAP: tl.constexpr,
++    BM: tl.constexpr,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++):
++    """GATED: out[r, n] = swiglu(x[r] . w[n], x[r] . w[n + N/2]) for
++    n < N/2 (OUT_N = N/2), the W13 projection. Else out[r, n] = x[r] . w[n].
++    GATHER: input row of sorted row r is token Order[r] // TOPK of X; else
++    row r of X. bf16 out, rounded as the reference rounds."""
++    t = tl.program_id(1)
++    expert = tl.load(TileExpert + t)
++    if expert < 0:
++        return
++    row0 = tl.load(TileRow0 + t)
++    row_end = tl.load(TileRowEnd + t)
++    rows = row0 + tl.arange(0, BM)
++    r_mask = rows < row_end
++    if GATHER:
++        src = tl.load(Order + rows, r_mask, other=0) // TOPK
++    else:
++        src = rows
++    src = src.to(tl.int64)
++    n_idx = tl.program_id(0) * BN + tl.arange(0, BN)
++    n_mask = n_idx < OUT_N
++    acc = tl.zeros((BM, BN), tl.float32)
++    if GATED:
++        acc_u = tl.zeros((BM, BN), tl.float32)
++    for k0 in range(0, K, BK):
++        kk = k0 + tl.arange(0, BK)
++        a = tl.load(X + src[:, None] * K + kk[None, :], r_mask[:, None], other=0.0)
++        w = _weight_tile(W, S, G, expert, n_idx, n_mask, k0, N, K, FMT, BN, BK)
++        acc = tl.dot(a, tl.trans(w), acc)
++        if GATED:
++            wu = _weight_tile(
++                W, S, G, expert, n_idx + OUT_N, n_mask, k0, N, K, FMT, BN, BK
++            )
++            acc_u = tl.dot(a, tl.trans(wu), acc_u)
++    if GATED:
++        # Reference: bf16 linear output, fp32 softcapped SwiGLU, bf16 out.
++        gate = acc.to(tl.bfloat16).to(tl.float32)
++        up = acc_u.to(tl.bfloat16).to(tl.float32)
++        sig = 1.0 / (1.0 + tl.exp(-gate))
++        y = _softcap(gate, GATE_CAP) * sig * _softcap(up, UP_CAP)
++    else:
++        y = acc
++    out_ptrs = Out + rows[:, None].to(tl.int64) * OUT_N + n_idx[None, :]
++    tl.store(out_ptrs, y.to(tl.bfloat16), r_mask[:, None] & n_mask[None, :])
++
++
++def plan_tiles(
++    topk_ids: torch.Tensor, num_experts: int, block_m: int
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Expert-sorted row order and BM-row tiles, without a host sync.
++
++    Returns `(order, tile_expert, tile_row0, tile_row_end)`: `order[r]` is
++    the flat (token * topk + slot) index of sorted row r."""
++    flat = topk_ids.reshape(-1).to(torch.int64)
++    rows = flat.numel()
++    order = torch.argsort(flat, stable=True)
++    # scatter_add, not bincount: bincount reads its max on the host, which
++    # breaks CUDA graph capture.
++    counts = torch.zeros(num_experts, dtype=torch.int64, device=flat.device)
++    counts.scatter_add_(0, flat, torch.ones_like(flat))
++    row_end = torch.cumsum(counts, 0)
++    row_start = row_end - counts
++    tiles = (counts + block_m - 1) // block_m
++    tile_end = torch.cumsum(tiles, 0)
++    tile_start = tile_end - tiles
++    max_tiles = min(num_experts, rows) + rows // block_m
++    t = torch.arange(max_tiles, device=flat.device)
++    expert = torch.searchsorted(tile_end, t, right=True)
++    valid = expert < num_experts
++    e = expert.clamp(max=num_experts - 1)
++    row0 = row_start[e] + (t - tile_start[e]) * block_m
++    tile_expert = torch.where(valid, e, torch.full_like(e, -1)).to(torch.int32)
++    return (
++        order.to(torch.int32),
++        tile_expert,
++        row0.to(torch.int32),
++        row_end[e].to(torch.int32),
++    )
++
++
++def _block_m(rows: int) -> int:
++    if rows <= 64:
++        return 16
++    if rows <= 2048:
++        return 32
++    return 64
++
++
++def expert_mlp(
++    x: torch.Tensor,
++    topk_ids: torch.Tensor,
++    topk_weights: torch.Tensor,
++    w13: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
++    w2: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
++    fmt: int,
++    gate_cap: float,
++    up_cap: float,
++) -> torch.Tensor:
++    """bf16 [T, D] routed-expert output: sum_k w_k * Expert_{id_k}(x), fp32
++    accumulate over k (deterministic order), bf16 out.
++
++    `w13`/`w2`: (weight, block scales, per-expert global scale or None)."""
++    num_tokens, hidden = x.shape
++    topk = topk_ids.shape[1]
++    out = torch.empty_like(x)
++    if num_tokens == 0:
++        return out
++    w13_w, w13_s, w13_g = w13
++    w2_w, w2_s, w2_g = w2
++    num_experts, n13 = w13_w.shape[:2]
++    inter = n13 // 2
++    rows = num_tokens * topk
++    bm = _block_m(rows)
++    order, tile_expert, tile_row0, tile_row_end = plan_tiles(
++        topk_ids, num_experts, bm
++    )
++    num_tiles = tile_expert.shape[0]
++    dummy = w13_s if w13_g is None else w13_g
++    bn, bk = 64, 64
++    assert hidden % bk == 0 and inter % bk == 0
++    act = torch.empty((rows, inter), dtype=torch.bfloat16, device=x.device)
++    _expert_gemm_kernel[(triton.cdiv(inter, bn), num_tiles)](
++        x,
++        order,
++        w13_w,
++        w13_s,
++        dummy,
++        act,
++        tile_expert,
++        tile_row0,
++        tile_row_end,
++        TOPK=topk,
++        N=n13,
++        K=hidden,
++        OUT_N=inter,
++        FMT=fmt,
++        GATED=True,
++        GATHER=True,
++        GATE_CAP=gate_cap,
++        UP_CAP=up_cap,
++        BM=bm,
++        BN=bn,
++        BK=bk,
++        num_warps=4,
++        num_stages=1,
++    )
++    down = torch.empty((rows, hidden), dtype=torch.bfloat16, device=x.device)
++    dummy = w2_s if w2_g is None else w2_g
++    _expert_gemm_kernel[(triton.cdiv(hidden, bn), num_tiles)](
++        act,
++        order,
++        w2_w,
++        w2_s,
++        dummy,
++        down,
++        tile_expert,
++        tile_row0,
++        tile_row_end,
++        TOPK=topk,
++        N=hidden,
++        K=inter,
++        OUT_N=hidden,
++        FMT=fmt,
++        GATED=False,
++        GATHER=False,
++        GATE_CAP=gate_cap,
++        UP_CAP=up_cap,
++        BM=bm,
++        BN=bn,
++        BK=bk,
++        num_warps=4,
++        num_stages=1,
++    )
++    # Reference combine: bf16 expert output * fp32 routing weight, summed in
++    # fp32. Scatter back to (token, slot) order, then a fixed-order sum.
++    order_l = order.to(torch.int64)
++    weights = topk_weights.reshape(-1).to(torch.float32)[order_l]
++    unsorted = torch.empty((rows, hidden), dtype=torch.float32, device=x.device)
++    unsorted[order_l] = down.float() * weights[:, None]
++    out.copy_(unsorted.view(num_tokens, topk, hidden).sum(dim=1))
++    return out
++
++
++def dequant_reference(
++    weight: torch.Tensor, scale: torch.Tensor, global_scale: torch.Tensor | None
++) -> torch.Tensor:
++    """Torch dequantization of a whole [E, N, *] expert weight to bf16 (for
++    tests; the reference conversion's order of operations)."""
++    if global_scale is not None:
++        lut = torch.tensor(
++            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
++             -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
++            device=weight.device,
++        )
++        codes = weight.to(torch.int64)
++        vals = torch.stack((lut[codes & 15], lut[codes >> 4]), -1).flatten(-2)
++        e, n, k = vals.shape
++        vals = vals.view(e, n, k // 16, 16) * scale.float()[..., None]
++        vals = vals * global_scale.float()[:, None, None, None]
++        return vals.view(e, n, k).to(torch.bfloat16)
++    e, n, k = weight.shape
++    vals = weight.float().view(e, n, k // 32, 32)
++    vals = vals * torch.exp2(scale.float() - 127)[..., None]
++    return vals.view(e, n, k).to(torch.bfloat16)
+-- 
+2.53.0
+

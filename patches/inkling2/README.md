@@ -1,0 +1,61 @@
+# Inkling-2-Mini on ROCm (gfx1201 / RDNA4): patch series
+
+Apply on vLLM main `1fd30e4f6e8f` (Nov 23 2026; includes the merged NVIDIA
+Inkling-2-Mini support, vllm-project/vllm#69028):
+
+```
+git clone https://github.com/vllm-project/vllm && cd vllm
+git checkout 1fd30e4f6e8f
+git am /path/to/patches/inkling2/*.patch
+```
+
+| # | Patch | Source | License |
+|---|-------|--------|---------|
+| 0001 | Add Inkling 2 Small support on ROCm (the `vllm/models/inkling2/amd/` package) | upstream vllm-project/vllm#67685 by Indira Vats (AMD), head `800f72e235ac`, cherry-picked verbatim | Apache-2.0 |
+| 0002 | Loop ops for the AMD package (blend norms, fp32 AttnRes mixes) | `pair_rms_norm` / `blend_rms_norm` ported from upstream `nvidia/ops/loop.py` (#69028), PTX rsqrt replaced with `tl.rsqrt`; AttnRes no-norm mode is original AEON | Apache-2.0 |
+| 0003 | NVFP4 and MXFP8 routed experts on RDNA4 | original AEON work (clean room, from `docs/inkling2-rocm/SPEC.md`); parameter names follow upstream `nvidia/moe.py` | Apache-2.0 |
+| 0004 | Per-pass KV caches and conv states for looped layers | port of the upstream NVIDIA design (`nvidia/attention.py`, `nvidia/loop.py`, #69028) to the AMD package | Apache-2.0 |
+| 0005 | Inkling-2-Mini (`inkling2_loop`) on RDNA4 and CDNA | loop model ported from upstream `nvidia/loop.py` (#69028); gfx12 wiring, arch gate, offloader hook are AEON | Apache-2.0 |
+| 0006 | AEON research hooks: weight overlay, activation capture, runtime o_proj ablation | original AEON work | Apache-2.0 |
+
+Clean room: no code, binaries or images from vllm-redshift were read or used.
+Sources were upstream vLLM (Apache-2.0), the model's HF config and
+transformers code, and AMD/Triton documentation.
+
+## Build (native, no Docker)
+
+`tools/setup_venv.sh` (TheRock ROCm 10.0 pip SDK + torch 2.13.0+rocm10.0.0,
+pins from upstream `docker/Dockerfile.rocm_base`), `tools/env.sh`, then
+`tools/build.sh` (`MAX_JOBS=6 uv pip install --no-build-isolation -e .`, plus
+`amdsmi` from the SDK so vLLM detects the ROCm platform).
+Never set `PYTORCH_HIP_ALLOC_CONF=expandable_segments`.
+
+## AEON hooks (patch 0006), all off by default
+
+- `AEON_WEIGHT_OVERLAY=a.safetensors[,b...]`: tensors replace the checkpoint
+  tensors with the same checkpoint name at load, e.g.
+  `model.llm.layers.12.attn.wo_ud.weight` (bf16 [2304, 3072]). Stock weights
+  are only read; no checkpoint copy or symlink tree is needed.
+- `AEON_CAPTURE_DIR`, `AEON_CAPTURE_APPS` (default `0-47`),
+  `AEON_CAPTURE_WHAT` (`resid,oproj_in,oproj_out`): per layer application
+  (looped layers 6..17 counted per pass: app = 6 + 12 * pass + layer - 6)
+  dump at the last prefill row of each request. Files carry positions and
+  the last 8 prompt ids for matching. Warmup steps also write files; filter
+  by `last_ids`. Keep prompts within one prefill chunk.
+- `AEON_ABLATE=edit.safetensors` with `dirs` [48, 2304] and `scales` [48]:
+  o_proj output y -> y - s_a r_a (r_a . y), the runtime form of
+  W' = (I - s r r^T) W with a separate scale per loop pass.
+- Full logprobs: `max_logprobs=1000`, `SamplingParams(prompt_logprobs=1000)`
+  gives teacher-forced top-1000 scoring (see `tools/kl_eval.py`).
+
+## Tools
+
+- `tools/kl_eval.py`: KL(stock transformers ref || vLLM) and top-1 on the
+  AEON stock reference set (full-vocab fp16 log-softmax memmap).
+- `tools/gen_bench.py`: multi-turn chats (greedy, capped, loop check) and
+  bs1 / bs8 decode tok/s.
+- `tools/test_moe_dequant.py`, `tools/moe_live.py`: expert kernel checks.
+- `tools/ref_dump.py`, `tools/vllm_dump.py`, `tools/cmp_dump.py`:
+  per-layer, per-pass activation diff vs transformers.
+- `tools/hooks_test.py`: functional test of the AEON hooks.
+- `tools/prof_decode.py`: rough per-module decode time split.
