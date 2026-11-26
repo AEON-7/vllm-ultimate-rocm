@@ -1,0 +1,306 @@
+From d48e62a277ca0cc15cccaff1e8d3c8e9de5e0f28 Mon Sep 17 00:00:00 2001
+From: AEON-7 <aeon-7@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 22:14:26 -0600
+Subject: [PATCH] [AEON M2] inkling2 gfx12: K/V tap projections in the qkvr
+ GEMV launch; one message mix per loop pass
+
+- ops/gemv.py: gemv3x runs the K/V dynamic tap projections in extra
+  programs of the qkvr GEMV (bitwise equal to separate GEMVs); main row
+  blocks keep unmasked loads. Used for M <= 4 (AEON_FUSE_TAPS,
+  AEON_FUSE_TAPS_MAX_M); at M=8 it measured slower in bs8 decode.
+- loop.py: the message bank is fixed per pass, so all core layer messages
+  are one attn-res launch per pass (AEON_BATCH_MESSAGES), read from the
+  stack without a bank copy. Bit-exact.
+
+gen_bench (R9700 GPU0, graph): bs1 79.2, bs8 373.1 tok/s. KL (max-batched 8,
+60 prompts) 0.00219, top-1 98.12%. Chats: 0 loops.
+Hook point unchanged: HOOKS.oproj right after o_proj in attention.forward.
+Original AEON work (clean room), Apache-2.0.
+---
+ vllm/models/inkling2/amd/attention.py | 39 ++++++++++++--
+ vllm/models/inkling2/amd/loop.py      | 50 ++++++++++++++----
+ vllm/models/inkling2/amd/ops/gemv.py  | 76 +++++++++++++++++++++------
+ 3 files changed, 134 insertions(+), 31 deletions(-)
+
+diff --git a/vllm/models/inkling2/amd/attention.py b/vllm/models/inkling2/amd/attention.py
+index bff5146af..5d00d874d 100644
+--- a/vllm/models/inkling2/amd/attention.py
++++ b/vllm/models/inkling2/amd/attention.py
+@@ -21,6 +21,13 @@ from vllm.distributed import (
+ from vllm.forward_context import get_forward_context
+ 
+ from .aeon_hooks import HOOKS
++import os as _os
++
++# AEON M2: fuse the K/V dynamic tap projections into the decode qkvr GEMV.
++_FUSE_TAPS = _os.environ.get("AEON_FUSE_TAPS", "1") == "1"
++# Rows up to which the tap projections ride in the qkvr launch (above it,
++# bs8 decode measured slower: 306 vs 372 tok/s).
++_FUSE_TAPS_MAX_M = int(_os.environ.get("AEON_FUSE_TAPS_MAX_M", "4"))
+ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+ from vllm.model_executor.layers.linear import (
+     MergedColumnParallelLinear,
+@@ -271,9 +278,24 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+         if _gemv.eligible(x_q, _gemv.MAX_M_QKVR) and x_k.stride() == x_q.stride() == x_v.stride():
+             # Decode (AEON M2): one GEMV launch over all of qkvr, each row
+             # range against its own input (the same input for local layers).
+-            projected = _gemv.gemv3(
+-                x_q, x_k, x_v, weight, q_side, q_side + kv_size
+-            )
++            if (
++                _FUSE_TAPS
++                and x_q.shape[0] <= _FUSE_TAPS_MAX_M
++                and self.k_sconv.dynamic
++                and self.v_sconv.dynamic
++                and self.k_sconv.weight_proj.dtype == torch.bfloat16
++            ):
++                # AEON M2: the K/V dynamic tap projections ride in the same
++                # launch (`taps` returned for `forward`).
++                projected, kt, vt = _gemv.gemv3x(
++                    x_q, x_k, x_v, weight, q_side, q_side + kv_size,
++                    self.k_sconv.weight_proj, self.v_sconv.weight_proj,
++                )
++                self._taps = (kt, vt)
++            else:
++                projected = _gemv.gemv3(
++                    x_q, x_k, x_v, weight, q_side, q_side + kv_size
++                )
+             return list(projected.split(self.split_sizes, dim=-1)[:6])
+         if x_k is x_q and x_v is x_q:
+             projected = nn.functional.linear(x_q, weight)
+@@ -317,7 +339,14 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+             if x_k is None:
+                 x_k = x_v = x_q
+         assert x_k is not None and x_v is not None
++        self._taps = None
+         q, r, gate, sinks, k, v = self._project(x_q, x_k, x_v)
++        if self._taps is not None:
++            k_taps, v_taps = self._taps
++            self._taps = None
++        else:
++            k_taps = self.k_sconv.dynamic_taps(x_k)
++            v_taps = self.v_sconv.dynamic_taps(x_v)
+         output = torch.empty(gate.shape, dtype=q.dtype, device=q.device)
+         self._attention(
+             positions,
+@@ -327,8 +356,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+             sinks,
+             k,
+             v,
+-            self.k_sconv.dynamic_taps(x_k),
+-            self.v_sconv.dynamic_taps(x_v),
++            k_taps,
++            v_taps,
+             tau,
+             output,
+             pass_idx,
+diff --git a/vllm/models/inkling2/amd/loop.py b/vllm/models/inkling2/amd/loop.py
+index bc6e8bd53..cddebbad7 100644
+--- a/vllm/models/inkling2/amd/loop.py
++++ b/vllm/models/inkling2/amd/loop.py
+@@ -35,6 +35,9 @@ from .ops.attn_res import attn_res
+ from .ops.loop import blend_rms_norm, pair_rms_norm
+ from .ops.loop_decode import MAX_T as _BLEND_MAX_T
+ from .ops.loop_decode import blend_decode
++import os as _os
++
++_BATCH_MESSAGES = _os.environ.get("AEON_BATCH_MESSAGES", "1") == "1"
+ 
+ LOOP_STREAMS = ("attn", "k", "v", "mlp")
+ 
+@@ -232,6 +235,7 @@ class Inkling2LoopModel(Inkling2Model):
+         next_norm: nn.Module | None,
+         positions: torch.Tensor,
+         tau: torch.Tensor | None,
++        pass_messages: torch.Tensor | None = None,
+     ) -> tuple[int, torch.Tensor]:
+         """Run decoder layer `i` in loop pass `pass_idx` on its `inputs`
+         (the attention inputs; for a visit with messages from `bank`, the
+@@ -244,16 +248,20 @@ class Inkling2LoopModel(Inkling2Model):
+         messages = None
+         if bank is not None:
+             assert isinstance(layer, Inkling2LoopDecoderLayer) and inputs is not None
+-            # All four streams' messages: a mix of the bank's two blocks.
+-            messages = attn_res(
+-                bank[:1],
+-                bank[1],
+-                None,
+-                self.message_queries[i - self.loop_core.start],
+-                None,
+-                0.0,
+-                True,
+-            )
++            if pass_messages is not None:
++                # AEON-7: precomputed for the whole pass (one launch per pass).
++                messages = pass_messages[i - self.loop_core.start]
++            else:
++                # All four streams' messages: a mix of the bank's two blocks.
++                messages = attn_res(
++                    bank[:1],
++                    bank[1],
++                    None,
++                    self.message_queries[i - self.loop_core.start],
++                    None,
++                    0.0,
++                    True,
++                )
+             norm = layer.attn_norm
+             dests, norm_weight = inputs, norm.weight
+             if layer.is_local:
+@@ -338,6 +346,7 @@ class Inkling2LoopModel(Inkling2Model):
+         next_norm: nn.Module | None
+         num_blocks = 0
+         inputs = bank = prelude_blocks = prelude_partial = prelude_dests = None
++        pass_messages = None
+         for visit, (i, pass_idx) in enumerate(visits):
+             looped = pass_idx > 0
+             if i == core.start and not looped:
+@@ -348,7 +357,25 @@ class Inkling2LoopModel(Inkling2Model):
+                 # previous pass's blocks (after the prelude's) and partial as
+                 # the messages' bank.
+                 assert prelude_blocks is not None and prelude_partial is not None
+-                bank = stack[prelude_blocks + 1 : num_blocks + 1].clone()
++                bank = stack[prelude_blocks + 1 : num_blocks + 1]
++                pass_messages = None
++                nq = self.message_queries.shape[0] * self.message_queries.shape[1]
++                if not (_BATCH_MESSAGES and nq * num_tokens <= 256):
++                    bank = bank.clone()
++                else:
++                    # AEON-7: the bank is fixed for the pass, so every core
++                    # layer's messages are one mix launch (same row kernel),
++                    # read straight from the stack before it is overwritten
++                    # (no bank copy).
++                    pass_messages = attn_res(
++                        bank[:1],
++                        bank[1],
++                        None,
++                        self.message_queries.view(nq, -1),
++                        None,
++                        0.0,
++                        True,
++                    ).view(*self.message_queries.shape[:2], num_tokens, hidden)
+                 num_blocks = prelude_blocks
+                 stack[num_blocks].copy_(prelude_partial)
+                 if prelude_dests is None:
+@@ -384,6 +411,7 @@ class Inkling2LoopModel(Inkling2Model):
+                 next_norm,
+                 positions,
+                 tau,
++                pass_messages if looped else None,
+             )
+             if HOOKS.enabled:
+                 HOOKS.resid(inputs[0])
+diff --git a/vllm/models/inkling2/amd/ops/gemv.py b/vllm/models/inkling2/amd/ops/gemv.py
+index 87521b2b7..f6a0cbc47 100644
+--- a/vllm/models/inkling2/amd/ops/gemv.py
++++ b/vllm/models/inkling2/amd/ops/gemv.py
+@@ -24,31 +24,21 @@ ENABLED = os.environ.get("AEON_GEMV", "1") == "1"
+ 
+ 
+ @triton.jit
+-def _gemv_kernel(
+-    X0, X1, X2, W, Y, M, N, K, N1, N2, stride_xm, stride_ym,
+-    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, EVEN_N: tl.constexpr,
+-):
+-    n0 = tl.program_id(0) * BN
++def _gemv_tile(X, W, Y, n0, M, N, K, stride_xm, stride_ym,
++               BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MASK_N: tl.constexpr):
+     n_idx = n0 + tl.arange(0, BN)
+     m_idx = tl.arange(0, BM)
+     mm = m_idx < M
+     nm = n_idx < N
+-    # Row blocks never straddle n1 / n2 (BN divides both).
+-    if n0 < N1:
+-        X = X0
+-    elif n0 < N2:
+-        X = X1
+-    else:
+-        X = X2
+     acc = tl.zeros((BM, BN, BK), tl.float32)
+     w_ptr = W + n_idx[:, None].to(tl.int64) * K
+     x_ptr = X + m_idx[:, None] * stride_xm
+     for k0 in range(0, K, BK):
+         kk = k0 + tl.arange(0, BK)
+-        if EVEN_N:
+-            w = tl.load(w_ptr + kk[None, :]).to(tl.float32)
+-        else:
++        if MASK_N:
+             w = tl.load(w_ptr + kk[None, :], mask=nm[:, None], other=0.0).to(tl.float32)
++        else:
++            w = tl.load(w_ptr + kk[None, :]).to(tl.float32)
+         x = tl.load(x_ptr + kk[None, :], mask=mm[:, None], other=0.0).to(tl.float32)
+         acc += x[:, None, :] * w[None, :, :]
+     y = tl.sum(acc, axis=2)
+@@ -56,6 +46,39 @@ def _gemv_kernel(
+     tl.store(ptrs, y.to(tl.bfloat16), mask=mm[:, None] & nm[None, :])
+ 
+ 
++@triton.jit
++def _gemv_kernel(
++    X0, X1, X2, W, Y, M, N, K, N1, N2, stride_xm, stride_ym,
++    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, EVEN_N: tl.constexpr,
++    WA=None, YA=None, NA=0, WB=None, YB=None, NB=0, stride_ya=0, stride_yb=0,
++    EXTRA: tl.constexpr = False,
++):
++    # EXTRA: programs past W's row blocks run two more small weights, WA
++    # against X1 and WB against X2, into their own outputs (the K/V dynamic
++    # tap projections fused into the qkvr launch). The main row blocks keep
++    # the unmasked weight loads.
++    pid = tl.program_id(0)
++    nb_main = tl.cdiv(N, BN)
++    if EXTRA and pid >= nb_main:
++        nb_a = tl.cdiv(NA, BN)
++        if pid - nb_main < nb_a:
++            _gemv_tile(X1, WA, YA, (pid - nb_main) * BN, M, NA, K, stride_xm, stride_ya,
++                       BM, BN, BK, True)
++        else:
++            _gemv_tile(X2, WB, YB, (pid - nb_main - nb_a) * BN, M, NB, K, stride_xm,
++                       stride_yb, BM, BN, BK, True)
++    else:
++        n0 = pid * BN
++        # Row blocks never straddle n1 / n2 (BN divides both).
++        if n0 < N1:
++            X = X0
++        elif n0 < N2:
++            X = X1
++        else:
++            X = X2
++        _gemv_tile(X, W, Y, n0, M, N, K, stride_xm, stride_ym, BM, BN, BK, not EVEN_N)
++
++
+ def _cfg(M: int, K: int) -> tuple[int, int, int, int]:
+     """(BM, BN, BK, num_warps) from uncached sweeps on gfx1201."""
+     bm = triton.next_power_of_2(max(M, 1))
+@@ -92,6 +115,29 @@ def gemv3(x0, x1, x2, w, n1: int, n2: int, cfg=None) -> torch.Tensor:
+     return out
+ 
+ 
++def gemv3x(x0, x1, x2, w, n1: int, n2: int, wa, wb, cfg=None):
++    """`gemv3` plus `x1 @ wa.T` and `x2 @ wb.T` in the same launch. Returns
++    (out, ya, yb)."""
++    M, K = x0.shape
++    N = w.shape[0]
++    assert w.shape[1] == K and w.stride(1) == 1
++    assert wa.shape[1] == K and wb.shape[1] == K and wa.stride(1) == wb.stride(1) == 1
++    assert wa.dtype == wb.dtype == w.dtype == torch.bfloat16
++    assert x1.stride() == x0.stride() and x2.stride() == x0.stride()
++    out = torch.empty((M, N), dtype=torch.bfloat16, device=x0.device)
++    ya = torch.empty((M, wa.shape[0]), dtype=torch.bfloat16, device=x0.device)
++    yb = torch.empty((M, wb.shape[0]), dtype=torch.bfloat16, device=x0.device)
++    bm, bn, bk, nw = cfg or _cfg(M, K)
++    assert n1 % bn == 0 and n2 % bn == 0
++    grid = (triton.cdiv(N, bn) + triton.cdiv(wa.shape[0], bn) + triton.cdiv(wb.shape[0], bn),)
++    _gemv_kernel[grid](
++        x0, x1, x2, w, out, M, N, K, n1, n2, x0.stride(0), out.stride(0),
++        BM=bm, BN=bn, BK=bk, EVEN_N=N % bn == 0,
++        WA=wa, YA=ya, NA=wa.shape[0], WB=wb, YB=yb, NB=wb.shape[0],
++        stride_ya=ya.stride(0), stride_yb=yb.stride(0), EXTRA=True, num_warps=nw)
++    return out, ya, yb
++
++
+ def gemv(x: torch.Tensor, w: torch.Tensor, cfg=None) -> torch.Tensor:
+     N = w.shape[0]
+     return gemv3(x, x, x, w, N, N, cfg)
+-- 
+2.53.0
+

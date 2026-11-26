@@ -1,0 +1,470 @@
+From ce1f64f961d714dccba61409e6cd12da11933b77 Mon Sep 17 00:00:00 2001
+From: AEON-7 <aeon-7@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 21:31:36 -0600
+Subject: [PATCH 11/12] [AEON M2] inkling2 gfx12: fuse static short conv with
+ the following attn-res mix (T<=8); MoE T=1 retune
+
+- ops/sconv_mix.py (new, AEON): one program per token runs the attn-out /
+  mlp-out conv + residual update and then the attn-res mix of that token for
+  every query, taking the conv output from registers. -2 launches per layer
+  visit (755 -> 611 kernels per bs1 step). AEON_FUSE_SCONV_MIX=0 disables.
+- sconv.Inkling2ShortConv.forward_mix; loop._run_layer uses it.
+- moe_decode: sort top-k also at T=1; NVFP4 per-row cfg (8,256,1)/(4,128,1).
+- o_proj hook point (HOOKS.oproj) unchanged.
+
+gen_bench bs1 78.1, bs8 372.9 tok/s; KL (max-batched 8, exercises T<=8 kernels) 0.00207 / top-1 98.12%.
+---
+ vllm/models/inkling2/amd/loop.py           |  41 +++--
+ vllm/models/inkling2/amd/ops/moe_decode.py |  46 ++++-
+ vllm/models/inkling2/amd/ops/sconv_mix.py  | 197 +++++++++++++++++++++
+ vllm/models/inkling2/amd/sconv.py          |  43 +++++
+ 4 files changed, 303 insertions(+), 24 deletions(-)
+ create mode 100644 vllm/models/inkling2/amd/ops/sconv_mix.py
+
+diff --git a/vllm/models/inkling2/amd/loop.py b/vllm/models/inkling2/amd/loop.py
+index 0bc1edd07..bc6e8bd53 100644
+--- a/vllm/models/inkling2/amd/loop.py
++++ b/vllm/models/inkling2/amd/loop.py
+@@ -270,21 +270,23 @@ class Inkling2LoopModel(Inkling2Model):
+         else:
+             attn_inputs = inputs
+         attn_partial = layer.attention(positions, attn_inputs, tau, pass_idx=pass_idx)
+-        attn_out = layer.attn_sconv(
+-            tensor_model_parallel_all_reduce(attn_partial), positions, owner=owner
+-        )
+-
+-        # The MLP input mixes the blocks with (partial +) attn_out.
++        # The MLP input mixes the blocks with (partial +) attn_out (fused with
++        # the attn-out conv for small batches).
+         first = i % self.block_size == 0
+         mlp_norm = None if messages is not None else layer.mlp_norm
+-        mlp_in = attn_res(
+-            stack[: num_blocks + first],
+-            attn_out if first else partial,
+-            None if first else attn_out,
+-            self.attn_res.mlp_queries[i],
+-            None if mlp_norm is None else mlp_norm.weight,
+-            0.0 if mlp_norm is None else mlp_norm.eps,
+-            self.normalize_values,
++        attn_out, mlp_in = layer.attn_sconv.forward_mix(
++            tensor_model_parallel_all_reduce(attn_partial),
++            positions,
++            (
++                stack[: num_blocks + first],
++                "out" if first else partial,
++                None if first else "out",
++                self.attn_res.mlp_queries[i],
++                None if mlp_norm is None else mlp_norm.weight,
++                0.0 if mlp_norm is None else mlp_norm.eps,
++                self.normalize_values,
++            ),
++            owner=owner,
+         )
+         if messages is not None:
+             assert isinstance(layer, Inkling2LoopDecoderLayer)
+@@ -297,15 +299,24 @@ class Inkling2LoopModel(Inkling2Model):
+         residual = None if first else partial
+         if residual is None:
+             num_blocks += 1
+-        layer.mlp_sconv(
++        _, next_inputs = layer.mlp_sconv.forward_mix(
+             layer.mlp(mlp_in[0]),
+             positions,
++            (
++                stack[:num_blocks],
++                stack[num_blocks],
++                None,
++                next_query,
++                None if next_norm is None else next_norm.weight,
++                0.0 if next_norm is None else next_norm.eps,
++                self.normalize_values,
++            ),
+             addend=attn_out,
+             residual=residual,
+             out=stack[num_blocks],
+             owner=owner,
+         )
+-        return num_blocks, self._next_inputs(stack, num_blocks, next_query, next_norm)
++        return num_blocks, next_inputs
+ 
+     def forward(
+         self, positions: torch.Tensor, inputs_embeds: torch.Tensor
+diff --git a/vllm/models/inkling2/amd/ops/moe_decode.py b/vllm/models/inkling2/amd/ops/moe_decode.py
+index d93ad645c..8af31c2ad 100644
+--- a/vllm/models/inkling2/amd/ops/moe_decode.py
++++ b/vllm/models/inkling2/amd/ops/moe_decode.py
+@@ -265,13 +265,34 @@ def _gemv_tile(W, S, G, expert, n_idx, x_ptr, K: tl.constexpr, N: tl.constexpr,
+ 
+ @triton.jit
+ def _gemv_tile_fast(W, S, G, expert, n_idx, x_ptr, K: tl.constexpr, N: tl.constexpr,
+-                    FMT: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, HW_FP8: tl.constexpr):
++                    FMT: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, HW_FP8: tl.constexpr,
++                    W64: tl.constexpr = False):
+     """Block-factored GEMV: sum_k x_k * code_k inside each scale block, then one
+     multiply by the block scale (and by the global scale at the end). The
+     dequantized weight is not rounded to bf16 first, so results differ from
+     the reference dequant by <= 0.5 bf16 ulp per weight (fp32 is more exact)."""
+     row = (expert * N + n_idx).to(tl.int64)
+-    if FMT == 0:
++    if W64 and FMT == 0:
++        # One 8-byte load per 16-code scale block; codes by shifting.
++        NB: tl.constexpr = BK // 16
++        acc = tl.zeros((BN, NB), tl.float32)
++        jb = tl.arange(0, NB)
++        i16 = tl.arange(0, 16)
++        wp = W.to(tl.pointer_type(tl.int64))
++        sh = (i16 * 4).to(tl.int64)
++        for k0 in range(0, K, BK):
++            w = tl.load(wp + row[:, None] * (K // 16) + k0 // 16 + jb[None, :])
++            codes = ((w[:, :, None] >> sh[None, None, :]) & 15).to(tl.int32)
++            xv = tl.load(x_ptr + k0 + jb[:, None] * 16 + i16[None, :]).to(tl.float32)
++            part = tl.sum(_e2m1_half(codes) * xv[None, :, :], axis=2)
++            sb = tl.load(S + row[:, None] * (K // 16) + k0 // 16 + jb[None, :])
++            if HW_FP8:
++                sc = sb.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++            else:
++                sc = _e4m3_to_f32(sb.to(tl.int32))
++            acc += part * sc
++        return tl.sum(acc, axis=1) * (tl.load(G + expert) * 16384.0)
++    elif FMT == 0:
+         NB: tl.constexpr = BK // 16
+         acc = tl.zeros((BN, NB), tl.float32)
+         jb = tl.arange(0, NB)
+@@ -330,7 +351,7 @@ def _expert_gemv_kernel(
+     HW_FP8: tl.constexpr, GATE_CAP: tl.constexpr, UP_CAP: tl.constexpr,
+     BN: tl.constexpr, BK: tl.constexpr, ROUND: tl.constexpr = True,
+     Ctr=None, Wts=None, Final=None, T=1, FUSE_COMBINE: tl.constexpr = False,
+-    SKIP_MIN: tl.constexpr = 0,
++    SKIP_MIN: tl.constexpr = 0, W64: tl.constexpr = False,
+ ):
+     """One program per (BN output columns, active expert, row of that
+     expert). Programs of one expert are adjacent so shared weight reads
+@@ -356,12 +377,12 @@ def _expert_gemv_kernel(
+     if ROUND:
+         a = _gemv_tile(W, S, G, expert, n_idx, x_ptr, K, N, FMT, BN, BK, HW_FP8, ROUND)
+     else:
+-        a = _gemv_tile_fast(W, S, G, expert, n_idx, x_ptr, K, N, FMT, BN, BK, HW_FP8)
++        a = _gemv_tile_fast(W, S, G, expert, n_idx, x_ptr, K, N, FMT, BN, BK, HW_FP8, W64)
+     if GATED:
+         if ROUND:
+             u = _gemv_tile(W, S, G, expert, n_idx + OUT_N, x_ptr, K, N, FMT, BN, BK, HW_FP8, ROUND)
+         else:
+-            u = _gemv_tile_fast(W, S, G, expert, n_idx + OUT_N, x_ptr, K, N, FMT, BN, BK, HW_FP8)
++            u = _gemv_tile_fast(W, S, G, expert, n_idx + OUT_N, x_ptr, K, N, FMT, BN, BK, HW_FP8, W64)
+         gate = a.to(tl.bfloat16).to(tl.float32)
+         up = u.to(tl.bfloat16).to(tl.float32)
+         sig = 1.0 / (1.0 + tl.exp(-gate))
+@@ -646,11 +667,18 @@ EXACT = os.environ.get("AEON_MOE_EXACT", "0") == "1"
+ _RB = {}
+ FUSE_ROUTER = os.environ.get("AEON_FUSE_ROUTER", "1") == "1"
+ # Sort-based top-k for all tokens at once (T >= SORT_TOPK_MIN) in the fused router.
+-SORT_TOPK_MIN = int(os.environ.get("AEON_SORT_TOPK_MIN", "2"))
++SORT_TOPK_MIN = int(os.environ.get("AEON_SORT_TOPK_MIN", "1"))
++# NVFP4 GEMV: 8-byte weight loads (one scale block each).
++W64_ON = os.environ.get("AEON_MOE_W64", "0") == "1"  # slower on gfx1201 (kept for reference)
++MOE_STAGES = int(os.environ.get("AEON_MOE_STAGES", "0"))  # 0: Triton default
+ FUSE_COMBINE = os.environ.get("AEON_FUSE_COMBINE", "1") == "1"
+ _COUNTERS: dict = {}
+ 
+ 
++def _stages() -> dict:
++    return {"num_stages": MOE_STAGES} if MOE_STAGES else {}
++
++
+ def _counters(dev) -> torch.Tensor:
+     """Persistent zeroed int32 arrival counters (self-resetting kernels);
+     first allocated in the eager warmup, before graph capture."""
+@@ -678,7 +706,7 @@ _DOT_BK = {(0, 13): int(os.environ.get("AEON_DOT_BK13", "64")), (0, 2): int(os.e
+ _AUTO_CFG = {(0, 13): (16, 256, 128, 64, 2), (0, 2): (16, 128, 128, 64, 2),
+              (1, 13): (16, 128, 64, 32, 4), (1, 2): (16, 64, 64, 32, 4)}
+ _CFG = {
+-    (0, 13): (16, 256, 4), (0, 2): (16, 128, 2),
++    (0, 13): (8, 256, 1), (0, 2): (4, 128, 1),
+     (1, 13): (16, 256, 8), (1, 2): (8, 128, 2),
+ }
+ 
+@@ -784,7 +812,7 @@ def moe_decode(x, weight, bias, topk, route_scale, w13, w2, fmt, gate_cap, up_ca
+         _expert_gemv_kernel[(inter // bn, n_act, maxr)](
+             x, w13_w, w13_s, w13_s if w13_g is None else w13_g, act, count, bucket, active,
+             TOPK=topk, N=n13, K=D, OUT_N=inter, MAXR=maxr, FMT=fmt, GATED=True, GATHER=True,
+-            HW_FP8=HW_FP8, GATE_CAP=gate_cap, UP_CAP=up_cap, BN=bn, BK=bk, ROUND=EXACT, num_warps=nw)
++            HW_FP8=HW_FP8, GATE_CAP=gate_cap, UP_CAP=up_cap, BN=bn, BK=bk, ROUND=EXACT, W64=W64_ON, num_warps=nw, **_stages())
+     down = torch.empty((rows, D), dtype=torch.bfloat16, device=dev)
+     bn, bk, nw = cfg.get((fmt, 2, rb), cfg[(fmt, 2)]) if rb > 1 else cfg[(fmt, 2)]
+     if rb > 1:
+@@ -796,7 +824,7 @@ def moe_decode(x, weight, bias, topk, route_scale, w13, w2, fmt, gate_cap, up_ca
+         _expert_gemv_kernel[(D // bn, n_act, maxr)](
+             act, w2_w, w2_s, w2_s if w2_g is None else w2_g, down, count, bucket, active,
+             TOPK=topk, N=D, K=inter, OUT_N=D, MAXR=maxr, FMT=fmt, GATED=False, GATHER=False,
+-            HW_FP8=HW_FP8, GATE_CAP=gate_cap, UP_CAP=up_cap, BN=bn, BK=bk, ROUND=EXACT,
++            HW_FP8=HW_FP8, GATE_CAP=gate_cap, UP_CAP=up_cap, BN=bn, BK=bk, ROUND=EXACT, W64=W64_ON, **_stages(),
+             Ctr=done[16:], Wts=wts, Final=out, T=T, FUSE_COMBINE=FUSE_COMBINE and rb == 1,
+             num_warps=nw)
+     if not (FUSE_COMBINE and rb == 1):
+diff --git a/vllm/models/inkling2/amd/ops/sconv_mix.py b/vllm/models/inkling2/amd/ops/sconv_mix.py
+new file mode 100644
+index 000000000..61ce509fb
+--- /dev/null
++++ b/vllm/models/inkling2/amd/ops/sconv_mix.py
+@@ -0,0 +1,197 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright 2026 AEON-7
++# Original AEON work (clean room); calls the PR #67685 (Apache-2.0) `_conv`
++# helper unchanged; the mix follows its `_attn_res_row_kernel` math.
++"""Small-batch fusion of a static short conv (with its residual update) and
++the attention-residual mix that consumes its output.
++
++One program per token holds the full channel row: it runs the
++`_sconv_kernel` math for all channels (in the mix's two row chunks), stores
++the conv output and keeps it in registers, then runs the
++`_attn_res_row_kernel` math for every pseudo-query of that token, taking the
++conv output from registers (no cross-warp memory dependency). Bit-equal
++to the two launches it replaces (same helpers, same op order, no fp fusion)
++and saves one launch per call (two per decoder-layer visit).
++"""
++
++import torch
++
++from vllm.triton_utils import tl, tldevice, triton
++
++from .sconv import _conv
++
++MAX_T = 8
++
++
++@triton.jit
++def _conv_chunk(x_ptr, cache_ptr, weight_ptr, out_ptr, res_ptr, addend_ptr, pos_ptr,
++                seq_idx_ptr, slot_ptr, block_table_ptr, qstart_ptr, T, stride_x, stride_c_blk,
++                stride_c_h, stride_c_n, stride_w0, stride_w1, stride_bt, max_blocks, N, scale,
++                t, coff, W: tl.constexpr, OFF: tl.constexpr, WS: tl.constexpr, H: tl.constexpr,
++                HAS_RES: tl.constexpr, HAS_ADDEND: tl.constexpr):
++    """`_sconv_kernel` (BT = 1) for channels `coff` of token t: stores the
++    output and returns it (output dtype, [1, len(coff)])."""
++    toff = t + tl.arange(0, 1)
++    C = H * WS
++    t_mask = toff < T
++    c_mask = coff < C
++    y = _conv(
++        x_ptr, stride_x, cache_ptr,
++        tl.minimum(coff // WS, H - 1) * stride_c_h + OFF + coff % WS,
++        stride_c_blk, stride_c_n, N, weight_ptr, stride_w0, stride_w1,
++        pos_ptr, seq_idx_ptr, slot_ptr, block_table_ptr, stride_bt, max_blocks,
++        qstart_ptr, scale, toff, coff, t_mask, c_mask, W,
++        SKIP_IDLE_CACHE=False, CACHE_FIRST=True, tile_reads_cache=True,
++    ).to(out_ptr.dtype.element_ty)
++    offs = toff[:, None] * C + coff[None, :]
++    mask = t_mask[:, None] & c_mask[None, :]
++    if HAS_ADDEND:
++        acc = tl.load(addend_ptr + offs, mask, other=0).to(tl.float32)
++        if HAS_RES:
++            acc = tl.load(res_ptr + offs, mask, other=0).to(tl.float32) + acc
++        y = (acc + y.to(tl.float32)).to(out_ptr.dtype.element_ty)
++    tl.store(out_ptr + offs, y, mask=mask)
++    return y
++
++
++@triton.jit
++def _src(Stack, stride_s, Last, Addend, row_off, offs, mask, n, N_STACK: tl.constexpr,
++         HAS_ADDEND: tl.constexpr, LAST_IS_OUT: tl.constexpr, ADDEND_IS_OUT: tl.constexpr,
++         y_reg):
++    """`_load_source` with this conv's output taken from registers (`y_reg`)
++    instead of memory where it is the last source or its addend."""
++    if n < N_STACK:
++        x = tl.load(Stack + n * stride_s + row_off + offs, mask, other=0).to(tl.float32)
++    else:
++        if LAST_IS_OUT:
++            x = y_reg
++        else:
++            x = tl.load(Last + row_off + offs, mask, other=0).to(tl.float32)
++        if HAS_ADDEND:
++            if ADDEND_IS_OUT:
++                x = x + y_reg
++            else:
++                x = x + tl.load(Addend + row_off + offs, mask, other=0).to(tl.float32)
++    return x
++
++
++@triton.jit
++def _sconv_mix_kernel(
++    x_ptr, cache_ptr, weight_ptr, out_ptr, res_ptr, addend_ptr,
++    pos_ptr, seq_idx_ptr, slot_ptr, block_table_ptr, qstart_ptr,
++    T, stride_x, stride_c_blk, stride_c_h, stride_c_n, stride_w0, stride_w1,
++    stride_bt, max_blocks, N, scale,
++    Stack, MLast, MAddend, Queries, NormW, MixOut, stride_s, eps, norm_eps,
++    W: tl.constexpr, OFF: tl.constexpr, WS: tl.constexpr, H: tl.constexpr,
++    HAS_RES: tl.constexpr, HAS_ADDEND: tl.constexpr,
++    D: tl.constexpr, NUM_Q: tl.constexpr, N_STACK: tl.constexpr,
++    M_HAS_ADDEND: tl.constexpr, NORMALIZE: tl.constexpr, BLOCK_N: tl.constexpr,
++    BLOCK_A: tl.constexpr, BLOCK_B: tl.constexpr, APPLY_NORM: tl.constexpr,
++    LAST_IS_OUT: tl.constexpr, ADDEND_IS_OUT: tl.constexpr,
++):
++    t = tl.program_id(0)
++    da = tl.arange(0, BLOCK_A)
++    db = BLOCK_A + tl.arange(0, BLOCK_B)
++    mask_a = da < D
++    mask_b = db < D
++    cargs = (x_ptr, cache_ptr, weight_ptr, out_ptr, res_ptr, addend_ptr, pos_ptr,
++             seq_idx_ptr, slot_ptr, block_table_ptr, qstart_ptr, T, stride_x, stride_c_blk,
++             stride_c_h, stride_c_n, stride_w0, stride_w1, stride_bt, max_blocks, N, scale, t)
++    # The conv output stays in registers for the mix (no cross-warp reload).
++    ya = tl.reshape(_conv_chunk(*cargs, da, W, OFF, WS, H, HAS_RES, HAS_ADDEND),
++                    (BLOCK_A,)).to(tl.float32)
++    yb = tl.reshape(_conv_chunk(*cargs, db, W, OFF, WS, H, HAS_RES, HAS_ADDEND),
++                    (BLOCK_B,)).to(tl.float32)
++    ya = tl.where(mask_a, ya, 0.0)
++    yb = tl.where(mask_b, yb, 0.0)
++    row_off = t.to(tl.int64) * D
++    n_idx = tl.arange(0, BLOCK_N)
++    for qi in tl.static_range(NUM_Q):
++        q_off = qi * D
++        qa = tl.load(Queries + q_off + da, mask_a, other=0)
++        qb = tl.load(Queries + q_off + db, mask_b, other=0)
++        logits = tl.full((BLOCK_N,), float("-inf"), tl.float32)
++        inv_rms = tl.zeros((BLOCK_N,), tl.float32)
++        for n in tl.static_range(N_STACK + 1):
++            xa = _src(Stack, stride_s, MLast, MAddend, row_off, da, mask_a, n, N_STACK,
++                      M_HAS_ADDEND, LAST_IS_OUT, ADDEND_IS_OUT, ya)
++            xb = _src(Stack, stride_s, MLast, MAddend, row_off, db, mask_b, n, N_STACK,
++                      M_HAS_ADDEND, LAST_IS_OUT, ADDEND_IS_OUT, yb)
++            rstd = tl.rsqrt(tl.fma(tl.sum(xa * xa) + tl.sum(xb * xb), 1.0 / D, eps))
++            inv_rms = tl.where(n_idx == n, rstd, inv_rms)
++            dot = tl.sum(qa * xa) + tl.sum(qb * xb)
++            logits = tl.where(n_idx == n, dot * rstd, logits)
++        probs = tldevice.exp(logits - tl.max(logits))
++        inv_sum = tl.div_rn(1.0, tl.sum(probs))
++        if NORMALIZE:
++            probs = probs * inv_rms
++        acc_a = tl.zeros((BLOCK_A,), tl.float32)
++        acc_b = tl.zeros((BLOCK_B,), tl.float32)
++        for n in tl.static_range(N_STACK + 1):
++            p = tl.sum(tl.where(n_idx == n, probs, 0.0))
++            xa = _src(Stack, stride_s, MLast, MAddend, row_off, da, mask_a, n, N_STACK,
++                      M_HAS_ADDEND, LAST_IS_OUT, ADDEND_IS_OUT, ya)
++            xb = _src(Stack, stride_s, MLast, MAddend, row_off, db, mask_b, n, N_STACK,
++                      M_HAS_ADDEND, LAST_IS_OUT, ADDEND_IS_OUT, yb)
++            acc_a = tl.fma(p, xa, acc_a)
++            acc_b = tl.fma(p, xb, acc_b)
++        acc_a = acc_a * inv_sum
++        acc_b = acc_b * inv_sum
++        mo = MixOut + qi * T * D + row_off
++        if APPLY_NORM:
++            sum_sq = tl.sum(acc_a * acc_a) + tl.sum(acc_b * acc_b)
++            out_rstd = tl.rsqrt(tl.div_rn(sum_sq, D) + norm_eps)
++            wa = tl.load(NormW + q_off + da, mask_a, other=0).to(tl.float32)
++            wb = tl.load(NormW + q_off + db, mask_b, other=0).to(tl.float32)
++            acc_a = acc_a * out_rstd * wa
++            acc_b = acc_b * out_rstd * wb
++        tl.store(mo + da, acc_a.to(MixOut.dtype.element_ty), mask_a)
++        tl.store(mo + db, acc_b.to(MixOut.dtype.element_ty), mask_b)
++
++
++def _same(a, b) -> bool:
++    return a is not None and a.data_ptr() == b.data_ptr() and a.shape == b.shape
++
++
++def short_conv_mix(
++    x, weight, cache, positions, block_table, seq_idx, slot_mapping, query_start,
++    stream_offset, stream_width, addend, residual, out,
++    stack, last, mix_addend, queries, norm_weight, norm_eps, normalize_values,
++    eps: float = 1e-6,
++):
++    """`short_conv(...)` then `attn_res(stack, last, mix_addend, queries,
++    norm_weight, ...)` in one launch (T <= MAX_T); `last` / `mix_addend` may
++    be `out`. Returns the mixes `(Q, T, D)`."""
++    num_tokens, channels = x.shape
++    num_heads = cache.shape[1]
++    width = weight.shape[1]
++    num_q, d = queries.shape
++    assert channels == num_heads * stream_width == d and width == 4
++    assert x.stride(1) == 1 and cache.stride(3) == 1 and out.is_contiguous()
++    assert last.is_contiguous() and queries.dtype == torch.float32
++    assert stack.stride(1) == d and stack.stride(2) == 1
++    apply_norm = norm_weight is not None
++    mix = torch.empty((num_q, num_tokens, d), dtype=last.dtype if apply_norm else torch.float32,
++                      device=x.device)
++    if num_tokens == 0:
++        return mix
++    block_a = triton.next_power_of_2(d + 1) // 2
++    block_b = max(triton.next_power_of_2(d - block_a), 16)
++    _sconv_mix_kernel[(num_tokens,)](
++        x, cache, weight, out, residual, addend,
++        positions, seq_idx, slot_mapping, block_table, query_start,
++        num_tokens, x.stride(0), cache.stride(0), cache.stride(1), cache.stride(2),
++        weight.stride(0), weight.stride(1), block_table.stride(0), block_table.shape[1],
++        cache.shape[2], (width + 1) ** -0.5,
++        stack, last, last if mix_addend is None else mix_addend, queries,
++        norm_weight if apply_norm else queries, mix,
++        stack.stride(0), eps, norm_eps,
++        W=width, OFF=stream_offset, WS=stream_width, H=num_heads,
++        HAS_RES=residual is not None, HAS_ADDEND=addend is not None,
++        D=d, NUM_Q=num_q, N_STACK=stack.shape[0], M_HAS_ADDEND=mix_addend is not None,
++        NORMALIZE=normalize_values, BLOCK_N=triton.next_power_of_2(stack.shape[0] + 1),
++        BLOCK_A=block_a, BLOCK_B=block_b, APPLY_NORM=apply_norm,
++        LAST_IS_OUT=_same(last, out), ADDEND_IS_OUT=_same(mix_addend, out),
++        num_warps=8, enable_fp_fusion=False,
++    )
++    return mix
+diff --git a/vllm/models/inkling2/amd/sconv.py b/vllm/models/inkling2/amd/sconv.py
+index 932cbfc75..991613ab7 100644
+--- a/vllm/models/inkling2/amd/sconv.py
++++ b/vllm/models/inkling2/amd/sconv.py
+@@ -30,6 +30,12 @@ from vllm.models.inkling.amd.sconv_swa_attn import (
+ from .ops import gemv as _gemv
+ from .ops.linear import linear_k_groups
+ from .ops.sconv import short_conv
++from .ops import sconv_mix as _sconv_mix
++from .ops.attn_res import attn_res as _attn_res
++import os as _os
++
++# AEON-7: fuse the static conv with the attn-res mix that follows (T <= 8).
++FUSE_SCONV_MIX = _os.environ.get("AEON_FUSE_SCONV_MIX", "1") == "1"
+ 
+ K_STREAM, V_STREAM, ATTN_STREAM, MLP_STREAM = range(4)
+ 
+@@ -121,6 +127,43 @@ class Inkling2ShortConv(nn.Module):
+             return linear_k_groups(x.contiguous(), self.weight_proj, x.dtype)
+         return _gemv.linear(x, self.weight_proj)
+ 
++    def forward_mix(
++        self,
++        x: torch.Tensor,
++        positions: torch.Tensor,
++        mix: tuple,
++        addend: torch.Tensor | None = None,
++        residual: torch.Tensor | None = None,
++        out: torch.Tensor | None = None,
++        owner: InklingConvState | None = None,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """AEON-7: `forward(...)` followed by `attn_res(stack, last,
++        mix_addend, queries, norm_weight, norm_eps, normalize)` from `mix`,
++        where `last` / `mix_addend` may be the string "out" (this conv's
++        output). One launch for small batches. Returns (out, mixes)."""
++        stack, last, mix_addend, queries, norm_weight, norm_eps, normalize = mix
++        if owner is None:
++            owner = self.owner
++        m = conv_metadata(owner)
++        num_tokens = x.shape[0]
++        if not FUSE_SCONV_MIX or m is None or num_tokens > _sconv_mix.MAX_T or self.dynamic:
++            out = self.forward(x, positions, addend, residual, out, owner)
++            last = out if isinstance(last, str) else last
++            mix_addend = out if isinstance(mix_addend, str) else mix_addend
++            return out, _attn_res(stack, last, mix_addend, queries, norm_weight, norm_eps,
++                                  normalize)
++        if out is None:
++            out = torch.empty((num_tokens, x.shape[1]), dtype=owner.kv_cache.dtype,
++                              device=x.device)
++        last = out if isinstance(last, str) else last
++        mix_addend = out if isinstance(mix_addend, str) else mix_addend
++        offset, width = owner.stream_ranges[self.stream]
++        mixes = _sconv_mix.short_conv_mix(
++            x, self.conv_weight, owner.kv_cache, positions, m.block_table, m.seq_idx,
++            m.slot_mapping, m.query_start, offset, width, addend, residual, out,
++            stack, last, mix_addend, queries, norm_weight, norm_eps, normalize)
++        return out, mixes
++
+     def forward(
+         self,
+         x: torch.Tensor,
+-- 
+2.53.0
+

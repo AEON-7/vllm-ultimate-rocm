@@ -1,0 +1,415 @@
+From 2c292c3d412013eb73dda9f6cc55e4686f0bc193 Mon Sep 17 00:00:00 2001
+From: AEON-7 <aeon-7@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:43:50 -0600
+Subject: [PATCH 07/12] [AEON M2] inkling2 gfx12: decode MoE (fused router +
+ per-expert GEMV) for T<=16
+
+Original AEON work. Router logits kernel (bf16 weight, fp32 accumulate,
+resets the routing scratch), top-k kernel with atomic per-expert buckets,
+block-factored NVFP4/MXFP8 expert GEMVs (SwiGLU fused into the w13 pass)
+and a slot-ordered combine. AEON_MOE_EXACT=1 rounds each dequantized
+weight to bf16 like the reference (slower).
+---
+ vllm/models/inkling2/amd/moe_gfx12.py      |  19 ++
+ vllm/models/inkling2/amd/ops/moe_decode.py | 353 +++++++++++++++++++++
+ 2 files changed, 372 insertions(+)
+ create mode 100644 vllm/models/inkling2/amd/ops/moe_decode.py
+
+diff --git a/vllm/models/inkling2/amd/moe_gfx12.py b/vllm/models/inkling2/amd/moe_gfx12.py
+index 1035356bb..f427f3532 100644
+--- a/vllm/models/inkling2/amd/moe_gfx12.py
++++ b/vllm/models/inkling2/amd/moe_gfx12.py
+@@ -26,6 +26,7 @@ from vllm.distributed import (
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.model_executor.utils import set_weight_attrs
+ 
++from .ops import moe_decode as _dec
+ from .ops.moe_dequant import expert_mlp
+ 
+ QuantFormat = Literal["nvfp4", "mxfp8"]
+@@ -172,5 +173,23 @@ class Inkling2Gfx12MoE(nn.Module):
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
+         """bf16 [T, H] -> bf16 [T, H]."""
+         x = x.contiguous()
++        ex = self.experts
++        if ex.ep_size == 1 and 0 < x.shape[0] <= (
++            _dec.MAX_DECODE_TOKENS if ex.nvfp4 else _dec.MXFP8_MAX_TOKENS
++        ):
++            # Decode path (AEON M2): fused router + per-expert GEMVs.
++            out, _, _ = _dec.moe_decode(
++                x,
++                self.gate.weight,
++                self.gate.bias,
++                self.gate.topk,
++                self.gate.route_scale,
++                ex._operands("w13"),
++                ex._operands("w2"),
++                0 if ex.nvfp4 else 1,
++                ex.gate_cap,
++                ex.up_cap,
++            )
++            return out
+         ids, weights = self.gate(x)
+         return self.experts(x, ids, weights)
+diff --git a/vllm/models/inkling2/amd/ops/moe_decode.py b/vllm/models/inkling2/amd/ops/moe_decode.py
+new file mode 100644
+index 000000000..1c54f92ab
+--- /dev/null
++++ b/vllm/models/inkling2/amd/ops/moe_decode.py
+@@ -0,0 +1,353 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright 2026 AEON-7
++# Original AEON work (clean room).
++"""Small-batch (decode) path of the Inkling2 gfx12 MoE. Four kernels per
++layer, no sort, no host sync, CUDA-graph safe (all shapes depend only on the
++token count).
++
++1. `_route_kernel` (one program per token): fp32 router logits, sigmoid,
++   top-k of `score + bias` by repeated argmax (lowest index wins ties),
++   weights normalized over the picks times `route_scale`. It also buckets the
++   (token, slot) rows by expert with atomics and appends each newly used
++   expert to a compact active list, so the expert kernels only launch
++   programs for used experts. Row order inside a bucket does not affect any
++   result (each row is computed independently).
++2. `_expert_kernel` GATED (W13) / plain (W2): one program per (active expert,
++   BN columns). The expert's weight tile is decoded once in registers and
++   multiplied with all of its rows (up to BM) by `tl.dot`. e2m1 codes are
++   decoded by placing their bits in an fp16 (exact; the 2^14 factor is folded
++   into the block scale), e4m3 / e8m0 scales by bit placement. Weights are
++   rounded to bf16 exactly as the reference dequantization rounds them, so
++   results match the reference math (bf16 GEMM outputs, fp32 softcapped
++   SwiGLU, bf16 activation).
++3. `_combine_kernel` (one program per token): bf16 expert outputs times fp32
++   routing weights, summed in fp32 in slot order, bf16 out.
++"""
++
++import os
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++from .moe_dequant import _e4m3_to_f32, _e8m0_to_f32, _softcap
++
++
++@triton.jit
++def _router_logits_kernel(
++    X, Wr, Logits, Count, Active, T,
++    D: tl.constexpr, E: tl.constexpr, N_ACT: tl.constexpr,
++    BE: tl.constexpr, BD: tl.constexpr, BT: tl.constexpr,
++):
++    """fp32 router logits [T, E] for a block of BE experts and all T tokens
++    (each router weight read once). Program 0 also resets the routing
++    scratch (Count[E] and NActive = 0, Active = -1) for the top-k kernel
++    that follows, so no separate memset launches are needed."""
++    pid = tl.program_id(0)
++    if pid == 0:
++        ce = tl.arange(0, E)
++        tl.store(Count + ce, 0)
++        tl.store(Count + E, 0)
++        ca = tl.arange(0, N_ACT)
++        tl.store(Active + ca, -1)
++    e_idx = pid * BE + tl.arange(0, BE)
++    t_idx = tl.arange(0, BT)
++    tm = t_idx < T
++    acc = tl.zeros((BT, BE, BD), tl.float32)
++    for d0 in range(0, D, BD):
++        dd = d0 + tl.arange(0, BD)
++        w = tl.load(Wr + e_idx[:, None] * D + dd[None, :]).to(tl.float32)
++        x = tl.load(X + t_idx[:, None] * D + dd[None, :], mask=tm[:, None], other=0.0).to(tl.float32)
++        acc += x[:, None, :] * w[None, :, :]
++    lg = tl.sum(acc, axis=2)
++    tl.store(Logits + t_idx[:, None] * E + e_idx[None, :], lg, mask=tm[:, None])
++
++
++@triton.jit
++def _route_kernel(
++    Logits, Bias, Ids, Wts, Count, Bucket, Active, NActive,
++    E: tl.constexpr, TOPK: tl.constexpr, SCALE: tl.constexpr, MAXR: tl.constexpr,
++):
++    t = tl.program_id(0)
++    e_idx = tl.arange(0, E)
++    acc = tl.load(Logits + t * E + e_idx)
++    score = 1.0 / (1.0 + tl.exp(-acc))
++    sel = score + tl.load(Bias + e_idx)
++    k_idx = tl.arange(0, TOPK)
++    ids = tl.zeros((TOPK,), tl.int32)
++    wts = tl.zeros((TOPK,), tl.float32)
++    for k in tl.static_range(TOPK):
++        m = tl.max(sel, axis=0)
++        pick = tl.min(tl.where(sel == m, e_idx, E), axis=0)
++        ids = tl.where(k_idx == k, pick, ids)
++        wts = tl.where(k_idx == k, tl.sum(tl.where(e_idx == pick, score, 0.0), axis=0), wts)
++        sel = tl.where(e_idx == pick, float("-inf"), sel)
++        slot = tl.atomic_add(Count + pick, 1)
++        tl.store(Bucket + pick * MAXR + slot, t * TOPK + k)
++        if slot == 0:
++            a = tl.atomic_add(NActive, 1)
++            tl.store(Active + a, pick)
++    wts = wts / (tl.sum(wts, axis=0) + 1e-20) * SCALE
++    tl.store(Ids + t * TOPK + k_idx, ids)
++    tl.store(Wts + t * TOPK + k_idx, wts)
++
++
++@triton.jit
++def _e2m1_half(code):
++    # e2m1 code (int32, 4 bits) -> fp32 value / 2^14, via fp16 bit placement:
++    # sign -> bit 15, (exp, man) -> bits 11..9. Exact for normals and the
++    # subnormal (code 1 -> 2^-15 = 0.5 / 2^14).
++    bits = ((code & 8) << 12) | ((code & 7) << 9)
++    return bits.to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32)
++
++
++@triton.jit
++def _dec_tile(W, S, G, expert, n_idx, k0, N: tl.constexpr, K: tl.constexpr,
++              FMT: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, HW_FP8: tl.constexpr):
++    """bf16 dequantized weight of rows `n_idx`, columns [k0, k0 + BK).
++    NVFP4: two [BN, BK/2] halves (even columns, odd columns). MXFP8: one
++    [BN, BK] tile (returned twice; the second is unused)."""
++    row = (expert * N + n_idx[:, None]).to(tl.int64)
++    if FMT == 0:
++        kb = k0 // 2 + tl.arange(0, BK // 2)
++        p = tl.load(W + row * (K // 2) + kb[None, :]).to(tl.int32)
++        ks = k0 // 16 + tl.arange(0, BK // 16)
++        sb = tl.load(S + row * (K // 16) + ks[None, :])
++        if HW_FP8:
++            s = sb.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++        else:
++            s = _e4m3_to_f32(sb.to(tl.int32))
++        s = s * 16384.0  # exact (power of two)
++        s = tl.reshape(tl.broadcast_to(s[:, :, None], (BN, BK // 16, 8)), (BN, BK // 2))
++        g = tl.load(G + expert)
++        lo = (_e2m1_half(p & 15) * s) * g
++        hi = (_e2m1_half(p >> 4) * s) * g
++        return lo.to(tl.bfloat16), hi.to(tl.bfloat16)
++    else:
++        kk = k0 + tl.arange(0, BK)
++        b = tl.load(W + row * K + kk[None, :])
++        if HW_FP8:
++            v = b.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++        else:
++            v = _e4m3_to_f32(b.to(tl.int32))
++        ks = k0 // 32 + tl.arange(0, BK // 32)
++        s = _e8m0_to_f32(tl.load(S + row * (K // 32) + ks[None, :]).to(tl.int32))
++        w = tl.reshape(v.reshape(BN, BK // 32, 32) * s[:, :, None], (BN, BK)).to(tl.bfloat16)
++        return w, w
++
++
++@triton.jit
++def _gemv_tile(W, S, G, expert, n_idx, x_ptr, K: tl.constexpr, N: tl.constexpr,
++               FMT: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, HW_FP8: tl.constexpr,
++               ROUND: tl.constexpr = True):
++    """fp32 [BN] = W[expert, n_idx, :] . x over all K: pure FMA into a
++    [BN, BK/2] (NVFP4) or [BN, BK] (MXFP8) register accumulator, one
++    reduction at the end (no dot, no layout conversion)."""
++    row = (expert * N + n_idx[:, None]).to(tl.int64)
++    if FMT == 0:
++        acc = tl.zeros((BN, BK // 2), tl.float32)
++        g = tl.load(G + expert)
++        for k0 in range(0, K, BK):
++            kb = k0 // 2 + tl.arange(0, BK // 2)
++            p = tl.load(W + row * (K // 2) + kb[None, :]).to(tl.int32)
++            ks = k0 // 16 + tl.arange(0, BK // 16)
++            sb = tl.load(S + row * (K // 16) + ks[None, :])
++            if HW_FP8:
++                s = sb.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++            else:
++                s = _e4m3_to_f32(sb.to(tl.int32))
++            s = s * 16384.0
++            s = tl.reshape(tl.broadcast_to(s[:, :, None], (BN, BK // 16, 8)), (BN, BK // 2))
++            lo = (_e2m1_half(p & 15) * s) * g
++            hi = (_e2m1_half(p >> 4) * s) * g
++            if ROUND:
++                lo = lo.to(tl.bfloat16).to(tl.float32)
++                hi = hi.to(tl.bfloat16).to(tl.float32)
++            x_e = tl.load(x_ptr + k0 + 2 * tl.arange(0, BK // 2)).to(tl.float32)
++            x_o = tl.load(x_ptr + k0 + 1 + 2 * tl.arange(0, BK // 2)).to(tl.float32)
++            acc += lo * x_e[None, :] + hi * x_o[None, :]
++    else:
++        acc = tl.zeros((BN, BK), tl.float32)
++        for k0 in range(0, K, BK):
++            kk = k0 + tl.arange(0, BK)
++            b = tl.load(W + row * K + kk[None, :])
++            if HW_FP8:
++                v = b.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++            else:
++                v = _e4m3_to_f32(b.to(tl.int32))
++            ks = k0 // 32 + tl.arange(0, BK // 32)
++            s = _e8m0_to_f32(tl.load(S + row * (K // 32) + ks[None, :]).to(tl.int32))
++            w = tl.reshape(v.reshape(BN, BK // 32, 32) * s[:, :, None], (BN, BK))
++            if ROUND:
++                w = w.to(tl.bfloat16).to(tl.float32)
++            acc += w * tl.load(x_ptr + kk).to(tl.float32)[None, :]
++    return tl.sum(acc, axis=1)
++
++
++@triton.jit
++def _gemv_tile_fast(W, S, G, expert, n_idx, x_ptr, K: tl.constexpr, N: tl.constexpr,
++                    FMT: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, HW_FP8: tl.constexpr):
++    """Block-factored GEMV: sum_k x_k * code_k inside each scale block, then one
++    multiply by the block scale (and by the global scale at the end). The
++    dequantized weight is not rounded to bf16 first, so results differ from
++    the reference dequant by <= 0.5 bf16 ulp per weight (fp32 is more exact)."""
++    row = (expert * N + n_idx).to(tl.int64)
++    if FMT == 0:
++        NB: tl.constexpr = BK // 16
++        acc = tl.zeros((BN, NB), tl.float32)
++        jb = tl.arange(0, NB)
++        ib = tl.arange(0, 8)
++        for k0 in range(0, K, BK):
++            off = (row[:, None, None] * (K // 2) + k0 // 2
++                   + jb[None, :, None] * 8 + ib[None, None, :])
++            p = tl.load(W + off).to(tl.int32)
++            xo = k0 + jb[:, None] * 16 + 2 * ib[None, :]
++            x_e = tl.load(x_ptr + xo).to(tl.float32)
++            x_o = tl.load(x_ptr + xo + 1).to(tl.float32)
++            part = tl.sum(_e2m1_half(p & 15) * x_e[None, :, :]
++                          + _e2m1_half(p >> 4) * x_o[None, :, :], axis=2)
++            sb = tl.load(S + row[:, None] * (K // 16) + k0 // 16 + jb[None, :])
++            if HW_FP8:
++                sc = sb.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++            else:
++                sc = _e4m3_to_f32(sb.to(tl.int32))
++            acc += part * sc
++        return tl.sum(acc, axis=1) * (tl.load(G + expert) * 16384.0)
++    else:
++        NB: tl.constexpr = BK // 32
++        acc = tl.zeros((BN, NB), tl.float32)
++        jb = tl.arange(0, NB)
++        ib = tl.arange(0, 32)
++        for k0 in range(0, K, BK):
++            kk = k0 + jb[:, None] * 32 + ib[None, :]
++            b = tl.load(W + row[:, None, None] * K + kk[None, :, :])
++            if HW_FP8:
++                v = b.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++            else:
++                v = _e4m3_to_f32(b.to(tl.int32))
++            part = tl.sum(v * tl.load(x_ptr + kk).to(tl.float32)[None, :, :], axis=2)
++            s = _e8m0_to_f32(tl.load(S + row[:, None] * (K // 32) + k0 // 32 + jb[None, :]).to(tl.int32))
++            acc += part * s
++        return tl.sum(acc, axis=1)
++
++
++@triton.jit
++def _expert_gemv_kernel(
++    X, W, S, G, Out, Count, Bucket, Active,
++    TOPK: tl.constexpr, N: tl.constexpr, K: tl.constexpr, OUT_N: tl.constexpr,
++    MAXR: tl.constexpr, FMT: tl.constexpr, GATED: tl.constexpr, GATHER: tl.constexpr,
++    HW_FP8: tl.constexpr, GATE_CAP: tl.constexpr, UP_CAP: tl.constexpr,
++    BN: tl.constexpr, BK: tl.constexpr, ROUND: tl.constexpr = True,
++):
++    """One program per (BN output columns, active expert, row of that
++    expert). Programs of one expert are adjacent so shared weight reads
++    hit in cache. GATED: SwiGLU of the gate and up GEMVs (W13)."""
++    expert = tl.load(Active + tl.program_id(1))
++    if expert < 0:
++        return
++    m = tl.program_id(2)
++    if m >= tl.load(Count + expert):
++        return
++    r = tl.load(Bucket + expert * MAXR + m)
++    if GATHER:
++        src = (r // TOPK).to(tl.int64)
++    else:
++        src = r.to(tl.int64)
++    n_idx = tl.program_id(0) * BN + tl.arange(0, BN)
++    x_ptr = X + src * K
++    if ROUND:
++        a = _gemv_tile(W, S, G, expert, n_idx, x_ptr, K, N, FMT, BN, BK, HW_FP8, ROUND)
++    else:
++        a = _gemv_tile_fast(W, S, G, expert, n_idx, x_ptr, K, N, FMT, BN, BK, HW_FP8)
++    if GATED:
++        if ROUND:
++            u = _gemv_tile(W, S, G, expert, n_idx + OUT_N, x_ptr, K, N, FMT, BN, BK, HW_FP8, ROUND)
++        else:
++            u = _gemv_tile_fast(W, S, G, expert, n_idx + OUT_N, x_ptr, K, N, FMT, BN, BK, HW_FP8)
++        gate = a.to(tl.bfloat16).to(tl.float32)
++        up = u.to(tl.bfloat16).to(tl.float32)
++        sig = 1.0 / (1.0 + tl.exp(-gate))
++        y = _softcap(gate, GATE_CAP) * sig * _softcap(up, UP_CAP)
++    else:
++        y = a
++    tl.store(Out + r.to(tl.int64) * OUT_N + n_idx, y.to(tl.bfloat16))
++
++
++@triton.jit
++def _combine_kernel(Down, Wts, Out, TOPK: tl.constexpr, D: tl.constexpr, BD: tl.constexpr):
++    t = tl.program_id(0)
++    dd = tl.program_id(1) * BD + tl.arange(0, BD)
++    acc = tl.zeros((BD,), tl.float32)
++    for k in range(TOPK):
++        r = t * TOPK + k
++        acc += tl.load(Down + r.to(tl.int64) * D + dd).to(tl.float32) * tl.load(Wts + r)
++    tl.store(Out + t.to(tl.int64) * D + dd, acc.to(tl.bfloat16))
++
++
++MAX_DECODE_TOKENS = int(os.environ.get("AEON_MOE_DECODE_MAX", "16"))
++# MXFP8 decode GEMV only beats the grouped GEMM path at very small T.
++MXFP8_MAX_TOKENS = min(MAX_DECODE_TOKENS, 2)
++TOPK_WARPS = int(os.environ.get("AEON_TOPK_WARPS", "1"))
++# maxr (padded token count) -> (experts per program, BD, num_warps)
++_ROUTER_CFG = {1: (1, 128, 4), 2: (1, 128, 4), 4: (1, 256, 8), 8: (1, 256, 8), 16: (1, 128, 8)}
++HW_FP8 = True
++# AEON_MOE_EXACT=1: round each dequantized weight to bf16 like the reference
++# (slower); default is the block-factored fp32 path.
++EXACT = os.environ.get("AEON_MOE_EXACT", "0") == "1"
++
++# (BN, BK, num_warps) per (format, projection); tuned on R9700.
++_CFG = {
++    (0, 13): (16, 256, 4), (0, 2): (16, 128, 2),
++    (1, 13): (16, 64, 4), (1, 2): (16, 64, 4),
++}
++
++
++def moe_decode(x, weight, bias, topk, route_scale, w13, w2, fmt, gate_cap, up_cap,
++               cfg: dict | None = None):
++    """Full routed MoE for T <= MAX_DECODE_TOKENS bf16 tokens. Returns
++    (out, ids, wts)."""
++    T, D = x.shape
++    E = weight.shape[0]
++    dev = x.device
++    out = torch.empty_like(x)
++    ids = torch.empty((T, topk), dtype=torch.int32, device=dev)
++    wts = torch.empty((T, topk), dtype=torch.float32, device=dev)
++    if T == 0:
++        return out, ids, wts
++    assert T <= MAX_DECODE_TOKENS
++    cfg = cfg or _CFG
++    w13_w, w13_s, w13_g = w13
++    w2_w, w2_s, w2_g = w2
++    n13 = w13_w.shape[1]
++    inter = n13 // 2
++    rows = T * topk
++    maxr = triton.next_power_of_2(T)
++    bm = max(16, maxr)
++    n_act = min(E, triton.next_power_of_2(rows))
++    # int32 scratch: counts [E], n_active [1], active [n_act]; reset by the
++    # logits kernel.
++    scratch = torch.empty(E + 1 + n_act, dtype=torch.int32, device=dev)
++    count, nactive, active = scratch[:E], scratch[E:E + 1], scratch[E + 1:]
++    bucket = torch.empty((E, maxr), dtype=torch.int32, device=dev)
++    logits = torch.empty((T, E), dtype=torch.float32, device=dev)
++    be, bd, nwr = _ROUTER_CFG.get(maxr, (2, 256, 4))
++    _router_logits_kernel[(E // be,)](
++        x, weight, logits, scratch, active, T, D=D, E=E,
++        N_ACT=n_act,
++        BE=be, BD=bd, BT=maxr, num_warps=nwr)
++    _route_kernel[(T,)](logits, bias, ids, wts, count, bucket, active, nactive,
++                        E=E, TOPK=topk, SCALE=route_scale, MAXR=maxr, num_warps=TOPK_WARPS)
++    act = torch.empty((rows, inter), dtype=torch.bfloat16, device=dev)
++    bn, bk, nw = cfg[(fmt, 13)]
++    _expert_gemv_kernel[(inter // bn, n_act, maxr)](
++        x, w13_w, w13_s, w13_s if w13_g is None else w13_g, act, count, bucket, active,
++        TOPK=topk, N=n13, K=D, OUT_N=inter, MAXR=maxr, FMT=fmt, GATED=True, GATHER=True,
++        HW_FP8=HW_FP8, GATE_CAP=gate_cap, UP_CAP=up_cap, BN=bn, BK=bk, ROUND=EXACT, num_warps=nw)
++    down = torch.empty((rows, D), dtype=torch.bfloat16, device=dev)
++    bn, bk, nw = cfg[(fmt, 2)]
++    _expert_gemv_kernel[(D // bn, n_act, maxr)](
++        act, w2_w, w2_s, w2_s if w2_g is None else w2_g, down, count, bucket, active,
++        TOPK=topk, N=D, K=inter, OUT_N=D, MAXR=maxr, FMT=fmt, GATED=False, GATHER=False,
++        HW_FP8=HW_FP8, GATE_CAP=gate_cap, UP_CAP=up_cap, BN=bn, BK=bk, ROUND=EXACT, num_warps=nw)
++    _combine_kernel[(T, D // 256)](down, wts, out, TOPK=topk, D=D, BD=256, num_warps=4)
++    return out, ids, wts
+-- 
+2.53.0
+
