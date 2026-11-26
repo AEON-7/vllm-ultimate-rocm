@@ -1,0 +1,171 @@
+{
+ "L10_nvfp4_w2_v34": {
+  "requant_unedited_exact_frac": 1.0,
+  "edit_rel_size": 0.023397663608193398,
+  "requant_rel_err": 0.023363137152045965,
+  "requant_err_over_edit": 0.9987262040376663,
+  "leak_v_energy_frac": 0.7634192705154419,
+  "orig_v_energy_frac_of_W": 0.0235043044667691
+ },
+ "L19_nvfp4_w2_v41": {
+  "requant_unedited_exact_frac": 1.0,
+  "edit_rel_size": 0.020501269958913326,
+  "requant_rel_err": 0.023551352554932237,
+  "requant_err_over_edit": 1.1485304236412048,
+  "leak_v_energy_frac": 0.7714709565043449,
+  "orig_v_energy_frac_of_W": 0.020584040321409702
+ },
+ "L21_mxfp8_scale_const_over_32_rows": false,
+ "L21_mxfp8_w2_v43": {
+  "requant_unedited_exact_frac": 1.0,
+  "edit_rel_size": 0.02043131459504366,
+  "requant_rel_err": 0.012666017632000148,
+  "requant_err_over_edit": 0.6185670644044876,
+  "leak_v_energy_frac": 0.27310797944664955,
+  "orig_v_energy_frac_of_W": 0.020515105919912457
+ },
+ "L23_mxfp8_scale_const_over_32_rows": false,
+ "L23_mxfp8_w2_v46": {
+  "requant_unedited_exact_frac": 1.0,
+  "edit_rel_size": 0.02250401466153562,
+  "requant_rel_err": 0.01305207482073456,
+  "requant_err_over_edit": 0.5786893144249916,
+  "leak_v_energy_frac": 0.24664831534028053,
+  "orig_v_energy_frac_of_W": 0.022604417521506548
+ },
+ "L10_nvfp4_w2_random_dir": {
+  "requant_unedited_exact_frac": 1.0,
+  "edit_rel_size": 0.020793691277503967,
+  "requant_rel_err": 0.021092843264341354,
+  "requant_err_over_edit": 1.0146303176879883,
+  "leak_v_energy_frac": 0.8388201594352722,
+  "orig_v_energy_frac_of_W": 0.02087588422000408
+ },
+ "L21_mxfp8_w2_random_dir": {
+  "requant_unedited_exact_frac": 1.0,
+  "edit_rel_size": 0.020954586565494537,
+  "requant_rel_err": 0.013224874623119831,
+  "requant_err_over_edit": 0.6296753287315369,
+  "leak_v_energy_frac": 0.2813328206539154,
+  "orig_v_energy_frac_of_W": 0.021036619320511818
+ },
+ "L10_wo_ud_writer_bf16": {
+  "edit_rel_size": 0.02271481603384018,
+  "bf16_rel_err": 0.0015737334033474326,
+  "leak_v_energy_frac": 0.005991026759147644
+ },
+ "L11_wq_du_consumer_bf16": {
+  "edit_rel_size": 0.023027580231428146,
+  "bf16_rel_err": 0.0015884035965427756,
+  "leak_v_energy_frac": 0.005500094499439001
+ },
+ "embed_rows_bf16_first20k": {
+  "leak_v_energy_frac": 0.005571527406573296
+ },
+ "L10_attn_sconv_v34": {
+  "tap_svals_rel": [
+   1.0,
+   0.0768,
+   0.0197,
+   0.0139
+  ],
+  "cos(c_j*v, v)": [
+   -0.3946,
+   -0.3033,
+   -0.3907,
+   0.9334
+  ],
+  "fold_P_before_conv": {
+   "leak": 0.37054798007011414,
+   "rel_err_vs_hook": 0.011366109363734722
+  },
+  "fold_rank4_before_conv": {
+   "leak": 4.904148909190553e-07,
+   "rel_err_vs_hook": 0.07895099371671677
+  }
+ },
+ "L10_mlp_sconv_v34": {
+  "tap_svals_rel": [
+   1.0,
+   0.0586,
+   0.0212,
+   0.0166
+  ],
+  "cos(c_j*v, v)": [
+   0.5952,
+   0.7037,
+   0.6904,
+   0.8919
+  ],
+  "fold_P_before_conv": {
+   "leak": 0.4556591212749481,
+   "rel_err_vs_hook": 0.01539240125566721
+  },
+  "fold_rank4_before_conv": {
+   "leak": 4.877168180428271e-07,
+   "rel_err_vs_hook": 0.13108818233013153
+  }
+ },
+ "L21_attn_sconv_v43": {
+  "tap_svals_rel": [
+   1.0,
+   0.047,
+   0.0082,
+   0.0038
+  ],
+  "cos(c_j*v, v)": [
+   -0.0587,
+   0.0768,
+   0.3219,
+   0.7712
+  ],
+  "fold_P_before_conv": {
+   "leak": 0.6468626856803894,
+   "rel_err_vs_hook": 0.03238033130764961
+  },
+  "fold_rank4_before_conv": {
+   "leak": 4.120921346384421e-07,
+   "rel_err_vs_hook": 0.15226450562477112
+  }
+ },
+ "L21_mlp_sconv_v43": {
+  "tap_svals_rel": [
+   1.0,
+   0.066,
+   0.0145,
+   0.0051
+  ],
+  "cos(c_j*v, v)": [
+   0.6478,
+   0.6882,
+   0.8121,
+   0.5228
+  ],
+  "fold_P_before_conv": {
+   "leak": 0.8496367931365967,
+   "rel_err_vs_hook": 0.06722375750541687
+  },
+  "fold_rank4_before_conv": {
+   "leak": 3.7188695500844915e-07,
+   "rel_err_vs_hook": 0.2804422080516815
+  }
+ },
+ "cos(g*v, v)": {
+  "L11_q_input_norm_v34": 0.9546678066253662,
+  "L11_k_input_norm_v34": 0.9366276264190674,
+  "L11_v_input_norm_v34": 0.9797302484512329,
+  "L12_attn_norm_v35": 0.9696173667907715,
+  "L11_mlp_norm_v34": 0.9860173463821411,
+  "final_norm_v47": 0.9417550563812256,
+  "embed_norm_v0": 0.8609046936035156
+ },
+ "cos(gL11q*v, gL12*v)_v34": 0.966044545173645,
+ "cos(v_app, v_app+12)_layer10": [
+  0.8962920904159546,
+  0.9437302350997925
+ ],
+ "cos(v_app, v_app+12)_layer5_17_29": [
+  0.13749724626541138,
+  0.8337015509605408
+ ]
+}

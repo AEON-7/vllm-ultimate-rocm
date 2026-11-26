@@ -27,6 +27,7 @@ git am /path/to/patches/inkling2/*.patch
 | 0014 | M2: batch-invariant MoE mode, on automatically for ablation variant servers | original AEON work | Apache-2.0 |
 | 0015 | M3 (opt-in): DSpark draft KV write via the cache op on ROCm | original AEON work | Apache-2.0 |
 | 0016 | M3 (opt-in): DSpark draft dense layers on the AEON small-M GEMV | original AEON work | Apache-2.0 |
+| 0017 | R5-1: per-request residual-stream variant edits (`resid_dirs` / `resid_scales`) | original AEON work | Apache-2.0 |
 
 Clean room: no code, binaries or images from vllm-redshift were read or used.
 Sources were upstream vLLM (Apache-2.0), the model's HF config and
@@ -90,3 +91,13 @@ are independent of batch composition. See `docs/inkling2-rocm/M2_RESULTS.md`.
   (row-divergence / race checks), `tools/test_gemv2.py`, `tools/test_gemv3x.py`,
   `tools/test_moe_*.py`, `tools/test_auto_mx.py`, `tools/test_cfg_t1.py`
   (kernel unit tests), `tools/gen_bench_m2.json`, `tools/kl_m2_b8.json`.
+
+## R5-1 residual-stream variants (patch 0017, research tool)
+
+Variant files and `POST /aeon/variants` take optional `resid_dirs` / `resid_scales` (same shapes as
+`dirs` / `scales`). After layer application a, the attention-input mix of application a+1 gets the
+per-row rank-K removal (o_proj-only, residual-only or both). Stock rows are bitwise untouched and mixed
+batches are bitwise equal to running alone. The bakeable subset (apps 0-4, 41-47) folds offline into
+stock-format weights with `tools/r5_bake.py`. See `docs/inkling2-rocm/R5_RESIDUAL.md`. Tools:
+`tools/r5_bake.py`, `tools/test_r5_bake.py`, `tools/r5_validate.py` + `tools/r5_run.sh`,
+`tools/r5_unit*.py`, `tools/r5_bake_analysis.py`; results in `tools/r5_results/`.

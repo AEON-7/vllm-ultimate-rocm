@@ -1,0 +1,444 @@
+From 3a363b4e9e75d29c45381901944421c83003916e Mon Sep 17 00:00:00 2001
+From: AEON-7 <aeon-7@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 00:41:48 -0600
+Subject: [PATCH] [AEON R5-1] inkling2 ROCm: per-request residual-stream
+ variant edits
+
+Variants (AEON_VARIANT_DIR files and POST /aeon/variants) take optional
+resid_dirs / resid_scales (same shapes as dirs / scales). After layer
+application a, the mix entering application a+1 (the AEON_CAPTURE resid
+tensor, all input streams, its own dtype) gets the per-row fp32 rank-K
+removal y <- y - s r (r . y). Apps 17/29 edit the next pass's start input
+(copy of prelude_dests); app 47 edits the final hidden state. o_proj-only,
+residual-only or both, with separate scales/ranks; hot-added by rescan.
+
+Same Triton kernel with an nrows argument (row r uses token r % nrows);
+o_proj output is bitwise identical to before. Stock rows (vid 0) are never
+touched; per-row math, so mixed batches equal single-variant launches.
+---
+ vllm/entrypoints/openai/aeon_variants_api.py |  21 ++-
+ vllm/models/inkling2/amd/aeon_hooks.py       |  14 +-
+ vllm/models/inkling2/amd/aeon_variants.py    | 186 ++++++++++++++++---
+ vllm/models/inkling2/amd/loop.py             |   8 +
+ 4 files changed, 192 insertions(+), 37 deletions(-)
+
+diff --git a/vllm/entrypoints/openai/aeon_variants_api.py b/vllm/entrypoints/openai/aeon_variants_api.py
+index 67c26fe0e..5e7edd282 100644
+--- a/vllm/entrypoints/openai/aeon_variants_api.py
++++ b/vllm/entrypoints/openai/aeon_variants_api.py
+@@ -7,6 +7,8 @@ AEON_VARIANT_DIR is set).
+ GET    /aeon/variants          list registered variants
+ POST   /aeon/variants          register or replace one:
+        {"name": "v1", "dirs": [...], "scales": [...]}  (see aeon_variants)
++       optionally "resid_dirs": [...], "resid_scales": [...] (residual edit;
++       either pair may be omitted)
+        or {"name": "v1", "path": "/server/side/file.safetensors"}
+ DELETE /aeon/variants/{name}   remove one
+ Requests then pick a variant with "aeon_variant": "v1" (or "stock").
+@@ -26,6 +28,8 @@ class RegisterVariantRequest(BaseModel):
+     name: str
+     dirs: Any = None
+     scales: Any = None
++    resid_dirs: Any = None
++    resid_scales: Any = None
+     path: str | None = None
+     replace: bool = True
+ 
+@@ -46,13 +50,18 @@ async def register_variant(req: RegisterVariantRequest) -> dict:
+         if not req.replace and __import__("os").path.exists(av.variant_path(name)):
+             raise ValueError(f"variant {name!r} exists and replace=false")
+         if req.path:
+-            dirs, scales = av.read_variant(req.path)
+-        elif req.dirs is not None and req.scales is not None:
+-            dirs = torch.tensor(req.dirs, dtype=torch.float32)
+-            scales = torch.tensor(req.scales, dtype=torch.float32)
++            o, r = av.read_variant_full(req.path)
++            dirs, scales = o if o is not None else (None, None)
++            rdirs, rscales = r if r is not None else (None, None)
+         else:
+-            raise ValueError("give either path or dirs and scales")
+-        return av.save_variant(name, dirs, scales)
++            def t(x):
++                return None if x is None else torch.tensor(x, dtype=torch.float32)
++
++            dirs, scales = t(req.dirs), t(req.scales)
++            rdirs, rscales = t(req.resid_dirs), t(req.resid_scales)
++            if dirs is None and scales is None and rdirs is None and rscales is None:
++                raise ValueError("give path, or dirs+scales and/or resid_dirs+resid_scales")
++        return av.save_variant(name, dirs, scales, resid_dirs=rdirs, resid_scales=rscales)
+     except (ValueError, KeyError, RuntimeError, FileNotFoundError) as e:
+         raise HTTPException(status_code=400, detail=str(e)) from e
+ 
+diff --git a/vllm/models/inkling2/amd/aeon_hooks.py b/vllm/models/inkling2/amd/aeon_hooks.py
+index ea0eef4bf..6421c9392 100644
+--- a/vllm/models/inkling2/amd/aeon_hooks.py
++++ b/vllm/models/inkling2/amd/aeon_hooks.py
+@@ -32,7 +32,10 @@ AEON_ABLATE=/path/edit.safetensors
+ AEON_VARIANT_DIR=/path
+     Per-request multi-variant ablation (see aeon_variants.py): a bank of
+     registered rank-K edits applied per token right after o_proj, selected
+-    per request with extra_args["aeon_variant"]. Eager mode only.
++    per request with extra_args["aeon_variant"]. Eager mode only. Variants
++    with resid_dirs/resid_scales also edit the residual mix entering the
++    next application (resid_edit, called from loop.py after the capture, so
++    AEON_CAPTURE_WHAT=resid records the pre-edit stream).
+ """
+ 
+ from __future__ import annotations
+@@ -194,6 +197,15 @@ class AeonHooks:
+         if self._keep("resid"):
+             self._put("resid", x)
+ 
++    def resid_edit(self, x: torch.Tensor, app: int, copy: bool = False) -> torch.Tensor:
++        """Per-request residual edit of application `app` on the mix x (all
++        streams). copy=True edits a copy (for the shared pass-restart input)."""
++        if self.variants is None or not self.variants.resid_on(app):
++            return x
++        if copy:
++            x = x.clone()
++        return self.variants.apply_resid(x, app)
++
+     def end_step(self) -> None:
+         if self.variants is not None:
+             self.variants.end_step()
+diff --git a/vllm/models/inkling2/amd/aeon_variants.py b/vllm/models/inkling2/amd/aeon_variants.py
+index ba5ec6736..24dc648af 100644
+--- a/vllm/models/inkling2/amd/aeon_variants.py
++++ b/vllm/models/inkling2/amd/aeon_variants.py
+@@ -29,6 +29,19 @@ The worker rescans the directory at most every AEON_VARIANT_RESCAN_S seconds
+ (default 1.0) and immediately when a request names an unknown variant.
+ Requests select a variant with SamplingParams.extra_args["aeon_variant"]
+ (OpenAI API: top-level "aeon_variant" or vllm_xargs.aeon_variant).
++
++Residual-stream edits (R5). A variant file may also carry
++    resid_dirs, resid_scales   same shapes as dirs / scales
++in which case, after layer application a, the stream entering application
++a + 1 (the tensor AEON_CAPTURE_WHAT=resid records, every input stream of it)
++gets the same per-row rank-K removal with resid_dirs[a] / resid_scales[a].
++For a = 47 that is the final hidden state fed to the LM head. For the last
++application of a loop pass (a = 17, 29) the edit goes to the next pass's
++start input (the pass restart discards the captured mix and re-reads the
++prelude's state). A variant may be o_proj-only (dirs/scales), residual-only
++(resid_dirs/resid_scales) or both; omitted keys mean no edit of that kind.
++Residual edits work in the stream's dtype (fp32 mixes in the loop, bf16
++elsewhere) with fp32 math. Stock rows stay untouched.
+ """
+ 
+ from __future__ import annotations
+@@ -110,26 +123,57 @@ def canonicalize(dirs: torch.Tensor, scales: torch.Tensor) -> tuple[torch.Tensor
+     return dirs.contiguous(), scales.contiguous()
+ 
+ 
+-def save_variant(name: str, dirs: torch.Tensor, scales: torch.Tensor, root: str | None = None) -> dict:
+-    """Validate and atomically write a variant file. Returns its summary."""
++def canonicalize_pair(dirs: Any, scales: Any, what: str) -> tuple[torch.Tensor, torch.Tensor] | None:
++    if dirs is None and scales is None:
++        return None
++    if dirs is None or scales is None:
++        raise ValueError(f"give both {what} dirs and scales, or neither")
++    return canonicalize(dirs, scales)
++
++
++def save_variant(name: str, dirs: torch.Tensor | None, scales: torch.Tensor | None,
++                 root: str | None = None, resid_dirs: torch.Tensor | None = None,
++                 resid_scales: torch.Tensor | None = None) -> dict:
++    """Validate and atomically write a variant file. Returns its summary.
++    Either pair may be None (o_proj-only, residual-only, or both)."""
+     from safetensors.torch import save_file
+ 
+     name = normalize_name(name)
+     if name is None:
+         raise ValueError("'stock' is reserved for the unedited model")
+-    d, s = canonicalize(dirs, scales)
++    o = canonicalize_pair(dirs, scales, "o_proj")
++    r = canonicalize_pair(resid_dirs, resid_scales, "resid")
++    if o is None and r is None:
++        raise ValueError("a variant needs dirs/scales and/or resid_dirs/resid_scales")
++    if o is not None and r is not None and o[0].shape[2] != r[0].shape[2]:
++        raise ValueError(f"hidden mismatch: dirs {o[0].shape[2]} vs resid_dirs {r[0].shape[2]}")
++    t = {}
++    if o is not None:
++        t["dirs"], t["scales"] = o
++    if r is not None:
++        t["resid_dirs"], t["resid_scales"] = r
+     path = variant_path(name, root)
+     os.makedirs(os.path.dirname(path), exist_ok=True)
+     tmp = f"{path}.tmp{os.getpid()}"
+-    save_file({"dirs": d, "scales": s}, tmp)
++    save_file(t, tmp)
+     os.replace(tmp, path)
+-    return summarize(name, d, s, path)
++    return summarize(name, o, path, r)
+ 
+ 
+-def summarize(name: str, d: torch.Tensor, s: torch.Tensor, path: str) -> dict:
+-    apps = [a for a in range(NUM_APPS) if bool((s[a] != 0).any())]
+-    return {"name": name, "rank": int(d.shape[1]), "hidden": int(d.shape[2]),
+-            "nonzero_apps": apps, "salt": file_salt(path)}
++def _apps(s: torch.Tensor | None) -> list[int]:
++    if s is None:
++        return []
++    return [a for a in range(NUM_APPS) if bool((s[a] != 0).any())]
++
++
++def summarize(name: str, o: tuple | None, path: str, r: tuple | None = None) -> dict:
++    ref = o if o is not None else r
++    out = {"name": name, "rank": 0 if o is None else int(o[0].shape[1]),
++           "hidden": int(ref[0].shape[2]), "nonzero_apps": _apps(None if o is None else o[1]),
++           "resid_rank": 0 if r is None else int(r[0].shape[1]),
++           "resid_nonzero_apps": _apps(None if r is None else r[1]),
++           "salt": file_salt(path)}
++    return out
+ 
+ 
+ def file_salt(path: str) -> str:
+@@ -144,11 +188,27 @@ def cache_salt_for(name: str, user_salt: str | None = None) -> str:
+     return f"{user_salt}.{tag}"[-128:] if user_salt else tag
+ 
+ 
+-def read_variant(path: str) -> tuple[torch.Tensor, torch.Tensor]:
++def read_variant_full(path: str) -> tuple[tuple | None, tuple | None]:
++    """-> ((dirs, scales) or None, (resid_dirs, resid_scales) or None)."""
+     from safetensors.torch import load_file
+ 
+     t = load_file(path)
+-    return canonicalize(t["dirs"], t["scales"])
++    o = canonicalize_pair(t.get("dirs"), t.get("scales"), "o_proj")
++    r = canonicalize_pair(t.get("resid_dirs"), t.get("resid_scales"), "resid")
++    if o is None and r is None:
++        raise ValueError(f"{path}: no dirs/scales or resid_dirs/resid_scales")
++    if o is not None and r is not None and o[0].shape[2] != r[0].shape[2]:
++        raise ValueError(f"{path}: hidden mismatch between dirs and resid_dirs")
++    return o, r
++
++
++def read_variant(path: str) -> tuple[torch.Tensor, torch.Tensor]:
++    """o_proj part only (zero edit if the file is residual-only)."""
++    o, r = read_variant_full(path)
++    if o is None:
++        d = torch.zeros(NUM_APPS, 1, r[0].shape[2])
++        return d, torch.zeros(NUM_APPS, 1)
++    return o
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -166,11 +226,13 @@ def _get_kernel():
+ 
+     @triton.jit
+     def aeon_variant_oproj_kernel(
+-        y_ptr, stride_y, vid_ptr, dirs_ptr, scales_ptr, app, D,
++        y_ptr, stride_y, vid_ptr, dirs_ptr, scales_ptr, app, D, nrows,
+         NAPP: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexpr,
+     ):
++        # Row r of y uses the variant of token r % nrows (several input
++        # streams of the residual mix share one token map).
+         row = tl.program_id(0)
+-        v = tl.load(vid_ptr + row)
++        v = tl.load(vid_ptr + row % nrows)
+         if v != 0:
+             offs = tl.arange(0, BLOCK)
+             m = offs < D
+@@ -189,7 +251,11 @@ def _get_kernel():
+ 
+ def apply_rows_reference(y: torch.Tensor, vid: torch.Tensor, dirs: torch.Tensor,
+                          scales: torch.Tensor, app: int) -> torch.Tensor:
+-    """Torch reference of the kernel (fp32 per row, one bf16 rounding)."""
++    """Torch reference of the kernel (fp32 per row, one rounding to y's
++    dtype). y is [T, D] or [S, T, D] with vid [T]."""
++    if y.dim() == 3:
++        return torch.stack([apply_rows_reference(y[j], vid, dirs, scales, app)
++                            for j in range(y.shape[0])])
+     out = y.clone()
+     rows = (vid != 0).nonzero().flatten()
+     if rows.numel() == 0:
+@@ -218,6 +284,10 @@ class VariantBank:
+         self.next_slot = 1
+         self.dirs: torch.Tensor | None = None    # [cap, 48, K, D] fp32
+         self.scales: torch.Tensor | None = None  # [cap, 48, K] fp32
++        self.rdirs: torch.Tensor | None = None   # [cap, 48, Kr, D] fp32 (residual)
++        self.rscales: torch.Tensor | None = None  # [cap, 48, Kr] fp32
++        self.resid_mask: dict[int, np.ndarray] = {}
++        self.resid_on_apps = np.zeros(NUM_APPS, dtype=bool)
+         self.hidden: int | None = None
+         self.req_names: dict[int, str | None] = {}
+         self.vid: torch.Tensor | None = None     # [rows] int32
+@@ -240,22 +310,33 @@ class VariantBank:
+         self.req_names[req_index] = name
+ 
+     # -- registry -----------------------------------------------------------
++    @staticmethod
++    def _grow(old_d, old_s, cap: int, k: int, d: int, device):
++        new_d = torch.zeros(cap, NUM_APPS, k, d, dtype=torch.float32, device=device)
++        new_s = torch.zeros(cap, NUM_APPS, k, dtype=torch.float32, device=device)
++        if old_d is not None:
++            c0, _, k0, _ = old_d.shape
++            new_d[:c0, :, :k0] = old_d
++            new_s[:c0, :, :k0] = old_s
++        return new_d, new_s
++
+     def _alloc(self, cap: int, k: int, d: int) -> None:
+-        new_d = torch.zeros(cap, NUM_APPS, k, d, dtype=torch.float32, device=self.device)
+-        new_s = torch.zeros(cap, NUM_APPS, k, dtype=torch.float32, device=self.device)
+-        if self.dirs is not None:
+-            c0, _, k0, _ = self.dirs.shape
+-            new_d[:c0, :, :k0] = self.dirs
+-            new_s[:c0, :, :k0] = self.scales
+-        self.dirs, self.scales = new_d, new_s
++        self.dirs, self.scales = self._grow(self.dirs, self.scales, cap, k, d, self.device)
++
++    def _alloc_resid(self, cap: int, k: int, d: int) -> None:
++        self.rdirs, self.rscales = self._grow(self.rdirs, self.rscales, cap, k, d, self.device)
+ 
+     def _load(self, name: str, path: str) -> None:
+-        d, s = read_variant(path)
+-        k, hid = d.shape[1], d.shape[2]
++        o, r = read_variant_full(path)
++        hid = (o if o is not None else r)[0].shape[2]
+         if self.hidden is None:
+             self.hidden = hid
+         if hid != self.hidden:
+             raise ValueError(f"variant {name}: hidden {hid} != {self.hidden}")
++        if o is None:  # residual-only: zero o_proj rows (masked off below)
++            o = (torch.zeros(NUM_APPS, 1, hid), torch.zeros(NUM_APPS, 1))
++        d, s = o
++        k = d.shape[1]
+         slot = self.slots.get(name)
+         if slot is None:
+             slot = self.free.pop() if self.free else self.next_slot
+@@ -270,11 +351,31 @@ class VariantBank:
+         self.scales[slot].zero_()
+         self.dirs[slot, :, :k] = d.to(self.device)
+         self.scales[slot, :, :k] = s.to(self.device)
++        # residual table (allocated on first residual variant only)
++        if r is not None or self.rdirs is not None:
++            cap_r = 0 if self.rdirs is None else self.rdirs.shape[0]
++            kr0 = 0 if self.rdirs is None else self.rdirs.shape[2]
++            kr = 0 if r is None else r[0].shape[1]
++            if slot >= cap_r or kr > kr0:
++                self._alloc_resid(max(cap_r, self.dirs.shape[0], 1 << max(3, slot.bit_length())),
++                                  max(kr, kr0, 1), hid)
++            assert self.rdirs is not None and self.rscales is not None
++            self.rdirs[slot].zero_()
++            self.rscales[slot].zero_()
++            if r is not None:
++                self.rdirs[slot, :, :kr] = r[0].to(self.device)
++                self.rscales[slot, :, :kr] = r[1].to(self.device)
+         self.slots[name] = slot
+         self.app_mask[slot] = (s != 0).any(dim=1).numpy()
++        self.resid_mask[slot] = (np.zeros(NUM_APPS, dtype=bool) if r is None
++                                 else (r[1] != 0).any(dim=1).numpy())
+         on = np.nonzero(self.app_mask[slot])[0]
+-        logger.info("AEON variants: loaded %s -> slot %d (rank %d, %d apps%s)", name, slot, k,
+-                    len(on), f" {on[0]}..{on[-1]}" if len(on) else "")
++        ron = np.nonzero(self.resid_mask[slot])[0]
++        logger.info("AEON variants: loaded %s -> slot %d (o_proj rank %d, %d apps%s; "
++                    "resid rank %d, %d apps%s)", name, slot, k,
++                    len(on), f" {on[0]}..{on[-1]}" if len(on) else "",
++                    0 if r is None else r[0].shape[1], len(ron),
++                    f" {ron[0]}..{ron[-1]}" if len(ron) else "")
+ 
+     def scan(self) -> None:
+         self.last_scan = time.monotonic()
+@@ -303,6 +404,7 @@ class VariantBank:
+             slot = self.slots.pop(name)
+             self.stamp.pop(name, None)
+             self.app_mask.pop(slot, None)
++            self.resid_mask.pop(slot, None)
+             self.free.append(slot)
+             logger.info("AEON variants: removed %s (slot %d)", name, slot)
+ 
+@@ -343,15 +445,17 @@ class VariantBank:
+         vid = np.zeros(rows, dtype=np.int32)
+         vid[: int(qsl[n_req])] = np.repeat(slots, counts)
+         apps = np.zeros(NUM_APPS, dtype=bool)
++        rapps = np.zeros(NUM_APPS, dtype=bool)
+         for s in np.unique(slots):
+             if s:
+                 apps |= self.app_mask[int(s)]
+-        if not apps.any():
++                rapps |= self.resid_mask.get(int(s), rapps)
++        if not apps.any() and not rapps.any():
+             return
+         if self.vid is None or self.vid.numel() < rows:
+             self.vid = torch.zeros(max(rows, 8192), dtype=torch.int32, device=self.device)
+         self.vid[:rows].copy_(torch.from_numpy(vid).pin_memory(), non_blocking=True)
+-        self.rows, self.apps_on, self.active = rows, apps, True
++        self.rows, self.apps_on, self.resid_on_apps, self.active = rows, apps, rapps, True
+ 
+     def apply(self, y: torch.Tensor, app: int) -> torch.Tensor:
+         if not self.active or app < 0 or app >= NUM_APPS or not self.apps_on[app]:
+@@ -363,11 +467,33 @@ class VariantBank:
+         kern, np2 = _get_kernel()
+         assert self.dirs is not None
+         kern[(self.rows,)](
+-            y, y.stride(0), self.vid, self.dirs, self.scales, app, self.hidden,
++            y, y.stride(0), self.vid, self.dirs, self.scales, app, self.hidden, self.rows,
+             NAPP=NUM_APPS, K=self.dirs.shape[2], BLOCK=np2(self.hidden), num_warps=4,
+         )
+         return y
+ 
++    def resid_on(self, app: int) -> bool:
++        return bool(self.active and 0 <= app < NUM_APPS and self.resid_on_apps[app])
++
++    def apply_resid(self, x: torch.Tensor, app: int) -> torch.Tensor:
++        """In place on the residual mix x ([T, D] or [S, T, D], any float
++        dtype): rows of token t use the variant of t."""
++        if not self.resid_on(app):
++            return x
++        if (x.shape[-2] != self.rows or x.shape[-1] != self.hidden or not x.is_contiguous()
++                or x.dim() not in (2, 3)):
++            logger.error("AEON variants: residual %s does not match the step map "
++                         "(%d rows, hidden %s); edit skipped", tuple(x.shape), self.rows, self.hidden)
++            return x
++        kern, np2 = _get_kernel()
++        assert self.rdirs is not None
++        y = x.view(-1, self.hidden)
++        kern[(y.shape[0],)](
++            y, y.stride(0), self.vid, self.rdirs, self.rscales, app, self.hidden, self.rows,
++            NAPP=NUM_APPS, K=self.rdirs.shape[2], BLOCK=np2(self.hidden), num_warps=4,
++        )
++        return x
++
+     def end_step(self) -> None:
+         self.active = False
+ 
+@@ -413,8 +539,8 @@ def list_variants(root: str | None = None) -> list[dict]:
+             continue
+         path = os.path.join(root, fn)
+         try:
+-            d, s = read_variant(path)
+-            out.append(summarize(name, d, s, path))
++            o, r = read_variant_full(path)
++            out.append(summarize(name, o, path, r))
+         except Exception as e:
+             out.append({"name": name, "error": str(e)})
+     return out
+diff --git a/vllm/models/inkling2/amd/loop.py b/vllm/models/inkling2/amd/loop.py
+index cddebbad7..8ca036237 100644
+--- a/vllm/models/inkling2/amd/loop.py
++++ b/vllm/models/inkling2/amd/loop.py
+@@ -390,6 +390,11 @@ class Inkling2LoopModel(Inkling2Model):
+                         True,
+                     )
+                 inputs = prelude_dests
++                if HOOKS.enabled:
++                    # AEON-7: residual edit of the previous pass's last app
++                    # (17, 29) lands on this pass's start input (a copy:
++                    # prelude_dests is shared by every pass).
++                    inputs = HOOKS.resid_edit(prelude_dests, visit - 1, copy=True)
+             if visit in self.aux_hidden_state_layers:
+                 aux_hidden_states.append(stack[num_blocks].clone())
+             if visit + 1 == len(visits):
+@@ -415,6 +420,9 @@ class Inkling2LoopModel(Inkling2Model):
+             )
+             if HOOKS.enabled:
+                 HOOKS.resid(inputs[0])
++                restart = visit + 1 < len(visits) and visits[visit + 1][1] > pass_idx
++                if not restart:
++                    inputs = HOOKS.resid_edit(inputs, visit)
+         assert inputs is not None
+         out = inputs[0]
+         if self.aux_hidden_state_layers:
+-- 
+2.53.0
+

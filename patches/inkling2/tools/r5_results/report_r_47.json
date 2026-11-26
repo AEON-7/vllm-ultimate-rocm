@@ -1,0 +1,38 @@
+{
+ "variants": [
+  "r_47.safetensors"
+ ],
+ "edits": [
+  {
+   "tensor": "model.llm.unembed.weight",
+   "side": "in",
+   "apps": [
+    47
+   ],
+   "rank": 1,
+   "variant": "r_47.safetensors"
+  }
+ ],
+ "tensors": {
+  "model.llm.unembed.weight": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    201024,
+    2304
+   ],
+   "rel_change": 0.033150335472710915,
+   "rounding_rel_err": 0.0016157423895801534,
+   "leak": [
+    {
+     "apps": [
+      47
+     ],
+     "s": 1.0,
+     "left": 0.002913884727666876,
+     "ideal": 0.0
+    }
+   ]
+  }
+ },
+ "n_tensors": 1
+}

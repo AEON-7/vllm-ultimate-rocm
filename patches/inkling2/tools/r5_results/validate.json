@@ -1,0 +1,375 @@
+{
+ "engine": "/home/center/inkling/engines/aeon-cleanroom/wt-r5/vllm/__init__.py",
+ "B_mixed_vs_alone": {
+  "stock": {
+   "n": 16,
+   "exact": 16,
+   "first_div": [],
+   "kl_mean": 0.0,
+   "kl_max": 0.0,
+   "lp_absdiff_max": 0.0,
+   "positions": 1024
+  },
+  "r_res": {
+   "n": 16,
+   "exact": 16,
+   "first_div": [],
+   "kl_mean": 0.0,
+   "kl_max": 0.0,
+   "lp_absdiff_max": 0.0,
+   "positions": 1024
+  },
+  "r_both": {
+   "n": 16,
+   "exact": 16,
+   "first_div": [],
+   "kl_mean": 0.0,
+   "kl_max": 0.0,
+   "lp_absdiff_max": 0.0,
+   "positions": 1024
+  },
+  "r_res_h": {
+   "n": 16,
+   "exact": 16,
+   "first_div": [],
+   "kl_mean": 0.0,
+   "kl_max": 0.0,
+   "lp_absdiff_max": 0.0,
+   "positions": 1024
+  },
+  "r_cons": {
+   "n": 16,
+   "exact": 16,
+   "first_div": [],
+   "kl_mean": 0.0,
+   "kl_max": 0.0,
+   "lp_absdiff_max": 0.0,
+   "positions": 1024
+  },
+  "r_47": {
+   "n": 16,
+   "exact": 16,
+   "first_div": [],
+   "kl_mean": 0.0,
+   "kl_max": 0.0,
+   "lp_absdiff_max": 0.0,
+   "positions": 1024
+  },
+  "op_only": {
+   "n": 16,
+   "exact": 16,
+   "first_div": [],
+   "kl_mean": 0.0,
+   "kl_max": 0.0,
+   "lp_absdiff_max": 0.0,
+   "positions": 1024
+  },
+  "r_zero": {
+   "n": 16,
+   "exact": 16,
+   "first_div": [],
+   "kl_mean": 0.0,
+   "kl_max": 0.0,
+   "lp_absdiff_max": 0.0,
+   "positions": 1024
+  }
+ },
+ "A_stock_mixed_vs_plain": {
+  "n": 16,
+  "exact": 16,
+  "first_div": [],
+  "kl_mean": 0.0,
+  "kl_max": 0.0,
+  "lp_absdiff_max": 0.0,
+  "positions": 1024
+ },
+ "C_r_zero_vs_stock": {
+  "n": 16,
+  "exact": 16,
+  "first_div": [],
+  "kl_mean": 0.0,
+  "kl_max": 0.0,
+  "lp_absdiff_max": 0.0,
+  "positions": 1024
+ },
+ "effect_vs_stock_alone": {
+  "r_res": {
+   "n": 16,
+   "exact": 0,
+   "first_div": [
+    22,
+    22,
+    22,
+    22,
+    22,
+    22,
+    22,
+    22,
+    27,
+    27,
+    27,
+    27,
+    27,
+    27,
+    27,
+    27
+   ],
+   "kl_mean": 0.047997154778730476,
+   "kl_max": 0.817848405960536,
+   "lp_absdiff_max": 8.484764099121094,
+   "positions": 408
+  },
+  "r_both": {
+   "n": 16,
+   "exact": 0,
+   "first_div": [
+    22,
+    22,
+    22,
+    22,
+    22,
+    22,
+    22,
+    22,
+    27,
+    27,
+    27,
+    27,
+    27,
+    27,
+    27,
+    27
+   ],
+   "kl_mean": 0.05555155061018361,
+   "kl_max": 1.0028666245472084,
+   "lp_absdiff_max": 12.38277530670166,
+   "positions": 408
+  },
+  "r_res_h": {
+   "n": 16,
+   "exact": 0,
+   "first_div": [
+    22,
+    22,
+    22,
+    22,
+    22,
+    22,
+    22,
+    22,
+    27,
+    27,
+    27,
+    27,
+    27,
+    27,
+    27,
+    27
+   ],
+   "kl_mean": 0.018118313182933832,
+   "kl_max": 0.40449772639304804,
+   "lp_absdiff_max": 4.982093811035156,
+   "positions": 408
+  },
+  "r_cons": {
+   "n": 16,
+   "exact": 0,
+   "first_div": [
+    26,
+    26,
+    26,
+    27,
+    27,
+    27,
+    27,
+    27,
+    27,
+    27,
+    27,
+    31,
+    31,
+    31,
+    31,
+    31
+   ],
+   "kl_mean": 0.003785500026580212,
+   "kl_max": 0.09509859578805183,
+   "lp_absdiff_max": 5.793581962585449,
+   "positions": 465
+  },
+  "r_47": {
+   "n": 16,
+   "exact": 13,
+   "first_div": [
+    26,
+    26,
+    31
+   ],
+   "kl_mean": 0.0013756582671832624,
+   "kl_max": 0.07407689019983306,
+   "lp_absdiff_max": 5.045183181762695,
+   "positions": 918
+  },
+  "op_only": {
+   "n": 16,
+   "exact": 0,
+   "first_div": [
+    26,
+    26,
+    26,
+    27,
+    27,
+    27,
+    27,
+    27,
+    27,
+    27,
+    27,
+    27,
+    27,
+    27,
+    27,
+    27
+   ],
+   "kl_mean": 0.05739058563077611,
+   "kl_max": 1.5022782173820122,
+   "lp_absdiff_max": 11.740867137908936,
+   "positions": 445
+  },
+  "r_zero": {
+   "n": 16,
+   "exact": 14,
+   "first_div": [
+    26,
+    26
+   ],
+   "kl_mean": 0.0010134427989111569,
+   "kl_max": 0.040154965197016945,
+   "lp_absdiff_max": 4.361371994018555,
+   "positions": 950
+  }
+ },
+ "D_post_edit_dot": {
+  "10": {
+   "before": 2.6059978008270264,
+   "after": 0.0013462830102071166,
+   "dtype": "torch.bfloat16",
+   "stock_rows_bitwise": true
+  },
+  "17": {
+   "before": 3.2364423274993896,
+   "after": 5.968519189991639e-07,
+   "dtype": "torch.float32",
+   "stock_rows_bitwise": true
+  },
+  "30": {
+   "before": 11.728899955749512,
+   "after": 1.4433990145334974e-06,
+   "dtype": "torch.float32",
+   "stock_rows_bitwise": true
+  },
+  "47": {
+   "before": 18.74863052368164,
+   "after": 0.007631438318639994,
+   "dtype": "torch.bfloat16",
+   "stock_rows_bitwise": true
+  }
+ },
+ "E_hot_add": {
+  "late_vs_res_pos0": {
+   "n": 1,
+   "exact": 1,
+   "first_div": [],
+   "kl_mean": 0.0,
+   "kl_max": 0.0,
+   "lp_absdiff_max": 0.0,
+   "positions": 64
+  },
+  "late_vs_res_pos2": {
+   "n": 1,
+   "exact": 1,
+   "first_div": [],
+   "kl_mean": 0.0,
+   "kl_max": 0.0,
+   "lp_absdiff_max": 0.0,
+   "positions": 64
+  }
+ },
+ "F_consumer_fold": {
+  "bake_vs_hook": {
+   "n": 16,
+   "exact": 7,
+   "first_div": [
+    23,
+    32,
+    33,
+    40,
+    49,
+    49,
+    54,
+    56,
+    57
+   ],
+   "kl_mean": 0.0016699756628046464,
+   "kl_max": 0.05496275162617729,
+   "lp_absdiff_max": 7.382715225219727,
+   "positions": 840
+  },
+  "stock_vs_hook": {
+   "n": 16,
+   "exact": 1,
+   "first_div": [
+    5,
+    8,
+    17,
+    18,
+    19,
+    26,
+    26,
+    29,
+    29,
+    31,
+    33,
+    37,
+    37,
+    40,
+    46
+   ],
+   "kl_mean": 0.005653105779826627,
+   "kl_max": 0.23443731858151182,
+   "lp_absdiff_max": 7.506635665893555,
+   "positions": 480
+  },
+  "stock_vs_bake": {
+   "n": 16,
+   "exact": 2,
+   "first_div": [
+    5,
+    8,
+    17,
+    18,
+    19,
+    23,
+    26,
+    26,
+    29,
+    31,
+    37,
+    37,
+    46,
+    57
+   ],
+   "kl_mean": 0.00623370457949571,
+   "kl_max": 0.30473081224569754,
+   "lp_absdiff_max": 4.965400695800781,
+   "positions": 521
+  }
+ },
+ "H_tok_s": {
+  "stock8": 221.9628740364535,
+  "mixed8": 219.49360808793344,
+  "resid8": 221.0209617979212,
+  "plain8": 221.86650224485928
+ },
+ "elapsed_s": 1265.674288034439
+}
