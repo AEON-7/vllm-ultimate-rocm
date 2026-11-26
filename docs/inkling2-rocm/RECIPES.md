@@ -8,7 +8,7 @@ with both of these tags (same image):
 - `inkling2-r6`
 - `inkling2-r6-gfx1201-2026-11-25`
 
-DIGEST_PLACEHOLDER: sha256:<fill in the published manifest digest>
+Digest (both tags): sha256:f5679cd80380bacbfa8137490a4b729182d0d805bba589b132cd2e3a603afcec
 
 Pull:
 
